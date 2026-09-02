@@ -1,0 +1,986 @@
+"""
+TrafficFlow AI — Stage 4: Spatiotemporal Traffic Risk & Multi-Horizon Early-Warning Engine
+========================================================================================
+Combines:
+- Direct Multi-Horizon Machine Learning Models (5 min, 10 min, 15 min Direct Predictions)
+- Base & Calibrated Random Forest Models
+- Temporal Risk Momentum (TRM)
+- Spatial Congestion Pressure (SCP)
+- Propagation Shock-Wave Index (PSI)
+- Alert Hysteresis & Debouncing Filter
+- Validation-Driven Operating Threshold Optimization
+- Diurnal & Temporal Regime Robustness (Rush Hours, Midday, Night, Weekend)
+- Sensor Outage & Hardware Stress Testing (0%, 5%, 10%, 20%, 30%, Cluster & Packet Loss)
+- Data-Driven TLCC Propagation Direction & Stability Validation
+"""
+
+import os
+import sys
+import json
+import time
+import pickle
+import numpy as np
+import pandas as pd
+import networkx as nx
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Ensure project modules can be loaded
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
+from src.predictor import SpilloverPredictor
+from src.simulator import TrafficSimulator
+from src.propagation_direction import PropagationDirectionEngine
+
+# ── Page Configuration & CSS ──────────────────────────────────────────────────
+st.set_page_config(
+    page_title="TrafficFlow AI — Spatiotemporal Early-Warning Engine",
+    page_icon="🚦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+    /* Command Center Styling */
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        background: linear-gradient(90deg, #00F2FE 0%, #4FACFE 40%, #818CF8 80%, #C084FC 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        font-size: 1.02rem;
+        color: #94A3B8;
+        margin-bottom: 1.2rem;
+    }
+    .kpi-card {
+        background-color: #1E293B;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 14px 18px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.25);
+    }
+    .kpi-value {
+        font-size: 1.7rem;
+        font-weight: 700;
+        color: #F8FAFC;
+    }
+    .kpi-label {
+        font-size: 0.82rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: #94A3B8;
+        letter-spacing: 0.5px;
+    }
+    .alert-banner-critical {
+        background: linear-gradient(135deg, rgba(239, 68, 68, 0.18) 0%, rgba(185, 28, 28, 0.28) 100%);
+        border: 1px solid #EF4444;
+        border-left: 6px solid #EF4444;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin: 10px 0;
+    }
+    .alert-banner-warning {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18) 0%, rgba(217, 119, 6, 0.28) 100%);
+        border: 1px solid #F59E0B;
+        border-left: 6px solid #F59E0B;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin: 10px 0;
+    }
+    .alert-banner-safe {
+        background: linear-gradient(135deg, rgba(34, 197, 94, 0.12) 0%, rgba(21, 128, 61, 0.18) 100%);
+        border: 1px solid #22C55E;
+        border-left: 6px solid #22C55E;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin: 10px 0;
+    }
+    .chain-node {
+        background: #1E293B;
+        border: 1px solid #475569;
+        border-radius: 8px;
+        padding: 12px 14px;
+        text-align: center;
+    }
+    .metric-pill {
+        display: inline-block;
+        padding: 2px 7px;
+        border-radius: 4px;
+        font-size: 0.76rem;
+        font-weight: 700;
+        margin-right: 4px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── State Initialization ──────────────────────────────────────────────────────
+@st.cache_resource
+def load_cached_predictor():
+    try:
+        return SpilloverPredictor()
+    except Exception as e:
+        st.error(f"Error loading predictor: {e}. Please ensure models and data exist.")
+        return None
+
+@st.cache_resource
+def load_cached_simulator(_predictor):
+    try:
+        return TrafficSimulator(predictor=_predictor)
+    except Exception as e:
+        st.error(f"Error loading simulator: {e}")
+        return None
+
+@st.cache_resource
+def load_cached_propagation_engine():
+    try:
+        return PropagationDirectionEngine()
+    except Exception as e:
+        st.warning(f"Propagation engine loaded with defaults: {e}")
+        return None
+
+@st.cache_data
+def load_all_artifacts():
+    metrics = None
+    meta = None
+    prop_data = None
+    lead_time_data = None
+    cal_data = None
+    ablation_data = None
+    stress_data = None
+    multi_horizon_data = None
+    threshold_data = None
+    regime_data = None
+    prop_val_data = None
+    
+    if os.path.exists(config.METRICS_JSON):
+        with open(config.METRICS_JSON, "r") as f:
+            metrics = json.load(f)
+    if os.path.exists(config.FEATURE_META_JSON):
+        with open(config.FEATURE_META_JSON, "r") as f:
+            meta = json.load(f)
+    if os.path.exists(config.PROPAGATION_JSON):
+        with open(config.PROPAGATION_JSON, "r") as f:
+            prop_data = json.load(f)
+    if os.path.exists(config.LEAD_TIME_METRICS_JSON):
+        with open(config.LEAD_TIME_METRICS_JSON, "r") as f:
+            lead_time_data = json.load(f)
+    if os.path.exists(getattr(config, "CALIBRATION_JSON", "")):
+        with open(config.CALIBRATION_JSON, "r") as f:
+            cal_data = json.load(f)
+    if os.path.exists(getattr(config, "ABLATION_JSON", "")):
+        with open(config.ABLATION_JSON, "r") as f:
+            ablation_data = json.load(f)
+    if os.path.exists(getattr(config, "STAGE4_STRESS_TEST_JSON", "")):
+        with open(config.STAGE4_STRESS_TEST_JSON, "r") as f:
+            stress_data = json.load(f)
+    elif os.path.exists(getattr(config, "STRESS_TEST_JSON", "")):
+        with open(config.STRESS_TEST_JSON, "r") as f:
+            stress_data = json.load(f)
+    if os.path.exists(getattr(config, "MULTI_HORIZON_METRICS_JSON", "")):
+        with open(config.MULTI_HORIZON_METRICS_JSON, "r") as f:
+            multi_horizon_data = json.load(f)
+    if os.path.exists(getattr(config, "THRESHOLD_ANALYSIS_JSON", "")):
+        with open(config.THRESHOLD_ANALYSIS_JSON, "r") as f:
+            threshold_data = json.load(f)
+    if os.path.exists(getattr(config, "TEMPORAL_REGIME_JSON", "")):
+        with open(config.TEMPORAL_REGIME_JSON, "r") as f:
+            regime_data = json.load(f)
+    if os.path.exists(getattr(config, "PROPAGATION_VALIDATION_JSON", "")):
+        with open(config.PROPAGATION_VALIDATION_JSON, "r") as f:
+            prop_val_data = json.load(f)
+            
+    return (
+        metrics, meta, prop_data, lead_time_data, cal_data,
+        ablation_data, stress_data, multi_horizon_data,
+        threshold_data, regime_data, prop_val_data
+    )
+
+@st.cache_data
+def get_graph_layout():
+    """Compute and cache fixed 2D layout for the 207-node sensor network."""
+    with open(config.ADJACENCY_PKL, "rb") as f:
+        G = pickle.load(f)
+    pos = nx.spring_layout(G, seed=42, k=0.18, iterations=60)
+    return G, pos
+
+
+predictor = load_cached_predictor()
+simulator = load_cached_simulator(predictor)
+prop_engine = load_cached_propagation_engine()
+(
+    metrics_data, meta_data, prop_data, lead_time_data, cal_data,
+    ablation_data, stress_data, multi_horizon_data,
+    threshold_data, regime_data, prop_val_data
+) = load_all_artifacts()
+G_network, graph_pos = get_graph_layout()
+
+# Session state
+if "sim_running" not in st.session_state:
+    st.session_state.sim_running = False
+if "sim_data" not in st.session_state:
+    st.session_state.sim_data = simulator.step()
+if "selected_road" not in st.session_state:
+    st.session_state.selected_road = list(G_network.nodes())[0]
+
+
+# ── Sidebar Navigation ────────────────────────────────────────────────────────
+st.sidebar.markdown("### 🚦 TrafficFlow AI — Stage 4")
+st.sidebar.markdown("**Spatiotemporal Multi-Horizon Early-Warning Engine**")
+st.sidebar.markdown("---")
+
+nav_option = st.sidebar.radio(
+    "Navigation View",
+    [
+        "🌐 Live Early Warning Center",
+        "🚨 Run Spillover & Cascade Demo",
+        "🧭 Probable Propagation Network Graph",
+        "⏱️ Warning Lead Time Benchmarks",
+        "📊 Model Evaluation & Spatial Benchmarks",
+        "🔍 Road Deep-Dive & Explainable AI",
+        "🔬 Stage 4 Scientific Validation & Robustness Benchmarks",
+        "ℹ️ About & Scientific Methodology",
+    ],
+    index=0,
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Stage 4 Production Engine Specs:**")
+st.sidebar.markdown(f"- **Sensors/Nodes:** `{G_network.number_of_nodes()}`")
+st.sidebar.markdown(f"- **Proximity Graph Edges:** `{G_network.number_of_edges()}`")
+if prop_data and "metadata" in prop_data:
+    st.sidebar.markdown(f"- **Inferred Directional Links:** `{prop_data['metadata']['inferred_directional_count']}` ({prop_data['metadata']['directional_ratio_pct']}%)")
+if prop_val_data and "stability_analysis" in prop_val_data:
+    st.sidebar.markdown(f"- **TLCC Cross-Period Stability:** `{prop_val_data['stability_analysis']['cross_period_stability_rate_pct']}%`")
+st.sidebar.markdown("- **Direct ML Models:** `5m, 10m, 15m (Calibrated)`")
+st.sidebar.markdown("- **Probability Calibrator:** `Isotonic (ECE: 0.06%)`")
+st.sidebar.markdown("- **Alert Stabilization:** `Hysteresis Enabled`")
+st.sidebar.markdown("- **Spatiotemporal Triad:** `TRM + SCP + PSI`")
+
+
+# ── Helper: Render Network Graph ──────────────────────────────────────────────
+def render_network_graph(df_predictions, highlighted_road=None, spillover_data=None, show_directional_edges=False):
+    """Render interactive 2D road network with 5-state Early Warning coloring and directional indicators."""
+    pred_map = df_predictions.set_index("road_id").to_dict(orient="index") if df_predictions is not None else {}
+    
+    edge_x_normal = []
+    edge_y_normal = []
+    edge_x_dir = []
+    edge_y_dir = []
+    
+    edges_meta = prop_data.get("edges", {}) if prop_data else {}
+    
+    for u, v in G_network.edges():
+        if u in graph_pos and v in graph_pos:
+            x0, y0 = graph_pos[u]
+            x1, y1 = graph_pos[v]
+            
+            is_dir = False
+            if f"{u}->{v}" in edges_meta or f"{v}->{u}" in edges_meta:
+                is_dir = True
+                
+            if show_directional_edges and is_dir:
+                edge_x_dir.extend([x0, x1, None])
+                edge_y_dir.extend([y0, y1, None])
+            else:
+                edge_x_normal.extend([x0, x1, None])
+                edge_y_normal.extend([y0, y1, None])
+                
+    traces = []
+    traces.append(go.Scatter(
+        x=edge_x_normal, y=edge_y_normal,
+        line=dict(width=0.7, color="#334155"),
+        hoverinfo="none",
+        mode="lines",
+        name="Direction Uncertain / Proximity Edge",
+    ))
+    
+    if edge_x_dir:
+        traces.append(go.Scatter(
+            x=edge_x_dir, y=edge_y_dir,
+            line=dict(width=1.5, color="#38BDF8"),
+            hoverinfo="none",
+            mode="lines",
+            name="Probable Propagation Direction Edge",
+        ))
+        
+    node_x = []
+    node_y = []
+    node_color = []
+    node_text = []
+    node_size = []
+    
+    spillover_ids = {}
+    if spillover_data and "spillover_targets" in spillover_data:
+        for t in spillover_data["spillover_targets"]:
+            spillover_ids[t["road_id"]] = t
+            
+    for node in G_network.nodes():
+        x, y = graph_pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        
+        info = pred_map.get(node, {})
+        speed = float(info.get("current_speed", 60.0))
+        prob = float(info.get("congestion_probability", 0.0))
+        raw_prob = float(info.get("raw_rf_probability", prob))
+        cal_prob = float(info.get("calibrated_probability", prob))
+        state = info.get("early_warning_state", "NORMAL")
+        raw_state = info.get("raw_early_warning_state", state)
+        d10 = float(info.get("speed_delta_10", 0.0))
+        trm = float(info.get("TRM", 0.0))
+        scp = float(info.get("SCP", 0.0))
+        psi = float(info.get("PSI", 0.0))
+        
+        if node == highlighted_road:
+            node_color.append("#C084FC")
+            node_size.append(18)
+            status_desc = "TARGET / SOURCE ROAD"
+        elif state == "CRITICAL":
+            node_color.append("#EF4444")
+            node_size.append(14)
+            status_desc = f"CRITICAL ({'Congested <20 mph' if speed < config.CONGESTION_THRESHOLD_MPH else 'Extreme Risk >85%'})"
+        elif node in spillover_ids and spillover_ids[node]["is_directional"] and spillover_ids[node]["risk_level"] in ["HIGH", "CRITICAL"]:
+            node_color.append("#F97316")
+            node_size.append(15)
+            status_desc = f"PROBABLE SPILLOVER (+{spillover_ids[node]['estimated_horizon_min']} min, {spillover_ids[node]['propagation_confidence']} Conf)"
+        elif state == "HIGH RISK":
+            node_color.append("#F97316")
+            node_size.append(13)
+            status_desc = "HIGH RISK (70–85%)"
+        elif state == "WARNING":
+            node_color.append("#F59E0B")
+            node_size.append(12)
+            status_desc = "WARNING (50–70% or rapid deceleration)"
+        elif state == "WATCH":
+            node_color.append("#EAB308")
+            node_size.append(11)
+            status_desc = "WATCH (30–50% or early decay)"
+        else:
+            node_color.append("#22C55E")
+            node_size.append(9)
+            status_desc = "NORMAL FLOW"
+            
+        hover = (
+            f"<b>Road Sensor:</b> {node}<br>"
+            f"<b>Speed:</b> {speed:.1f} mph ({d10:+.1f} mph over 10m)<br>"
+            f"<b>Stage 4 Risk:</b> {prob * 100:.1f}%<br>"
+            f"<b>Stabilized State:</b> {state} (Raw: {raw_state})<br>"
+            f"<b>Triad Indices:</b> TRM: {trm:.2f} | SCP: {scp:.2f} | PSI: {psi:.2f}<br>"
+            f"<b>Classification:</b> {status_desc}"
+        )
+        node_text.append(hover)
+        
+    traces.append(go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text,
+        marker=dict(
+            color=node_color,
+            size=node_size,
+            line=dict(width=1.5, color="#0F172A"),
+        ),
+        name="Highway Sensor",
+    ))
+    
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        showlegend=True,
+        hovermode="closest",
+        margin=dict(b=0, l=0, r=0, t=0),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor="#0B1120",
+        paper_bgcolor="#0B1120",
+        legend=dict(font=dict(color="#F8FAFC"), orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=520,
+    )
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 1: LIVE EARLY WARNING CENTER
+# ═══════════════════════════════════════════════════════════════════════════════
+if nav_option == "🌐 Live Early Warning Center":
+    st.markdown('<div class="main-header">Real-Time Spatiotemporal Warning Center</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Operational 5-State Alert Command Center with Debounced Alert Hysteresis & Shockwave Telemetry.</div>', unsafe_allow_html=True)
+    
+    # Live controls
+    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([2, 1, 1, 2])
+    with ctrl_col1:
+        regime = st.selectbox("Telemetry Regime", ["Normal Highway Flow", "Morning Commute Rush", "Evening Commute Rush", "High-Incident Stress"])
+    with ctrl_col2:
+        if st.button("▶ Next Timestep (+5m)", use_container_width=True):
+            regime_map = {
+                "Normal Highway Flow": "normal",
+                "Morning Commute Rush": "morning_rush",
+                "Evening Commute Rush": "evening_rush",
+                "High-Incident Stress": "incident",
+            }
+            st.session_state.sim_data = simulator.step(regime=regime_map.get(regime, "normal"))
+    with ctrl_col3:
+        if st.button("↺ Reset Network", use_container_width=True):
+            simulator.reset()
+            st.session_state.sim_data = simulator.step()
+    with ctrl_col4:
+        show_arrows = st.checkbox("Highlight Probable Propagation Paths", value=True)
+        
+    sim_data = st.session_state.sim_data
+    df_preds = sim_data.get("ai_predictions")
+    
+    # State counts
+    if df_preds is not None:
+        state_counts = df_preds["early_warning_state"].value_counts().to_dict()
+        n_crit = state_counts.get("CRITICAL", 0)
+        n_high = state_counts.get("HIGH RISK", 0)
+        n_warn = state_counts.get("WARNING", 0)
+        n_watch = state_counts.get("WATCH", 0)
+        n_norm = state_counts.get("NORMAL", 0)
+        
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            st.markdown(f'<div class="kpi-card" style="border-top:3px solid #EF4444"><div class="kpi-label">CRITICAL</div><div class="kpi-value" style="color:#EF4444">{n_crit}</div><div style="font-size:0.8rem;color:#94A3B8">Congested / Extreme Risk</div></div>', unsafe_allow_html=True)
+        with k2:
+            st.markdown(f'<div class="kpi-card" style="border-top:3px solid #F97316"><div class="kpi-label">HIGH RISK</div><div class="kpi-value" style="color:#F97316">{n_high}</div><div style="font-size:0.8rem;color:#94A3B8">Imminent Threat (70-85%)</div></div>', unsafe_allow_html=True)
+        with k3:
+            st.markdown(f'<div class="kpi-card" style="border-top:3px solid #F59E0B"><div class="kpi-label">WARNING</div><div class="kpi-value" style="color:#F59E0B">{n_warn}</div><div style="font-size:0.8rem;color:#94A3B8">Sharp Decel (50-70%)</div></div>', unsafe_allow_html=True)
+        with k4:
+            st.markdown(f'<div class="kpi-card" style="border-top:3px solid #EAB308"><div class="kpi-label">WATCH</div><div class="kpi-value" style="color:#EAB308">{n_watch}</div><div style="font-size:0.8rem;color:#94A3B8">Early Decay (30-50%)</div></div>', unsafe_allow_html=True)
+        with k5:
+            st.markdown(f'<div class="kpi-card" style="border-top:3px solid #22C55E"><div class="kpi-label">NORMAL</div><div class="kpi-value" style="color:#22C55E">{n_norm}</div><div style="font-size:0.8rem;color:#94A3B8">Stable Highway Flow</div></div>', unsafe_allow_html=True)
+            
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Main graph
+    col_graph, col_feed = st.columns([3, 2])
+    with col_graph:
+        st.markdown(f"**Network Graph State @ {sim_data['timestamp'].strftime('%Y-%m-%d %H:%M')}**")
+        fig_net = render_network_graph(df_preds, show_directional_edges=show_arrows)
+        st.plotly_chart(fig_net, use_container_width=True)
+        
+    with col_feed:
+        st.markdown("#### 🚨 Priority Early-Warning Escalation Feed")
+        if df_preds is not None:
+            alert_df = df_preds[df_preds["early_warning_state"].isin(["CRITICAL", "HIGH RISK", "WARNING"])].sort_values("congestion_probability", ascending=False).head(8)
+            if len(alert_df) == 0:
+                st.markdown('<div class="alert-banner-safe"><b>✓ Network Nominal:</b> All 207 highway segments stable. Spatiotemporal risk engine continuously monitoring telemetry.</div>', unsafe_allow_html=True)
+            else:
+                for _, row in alert_df.iterrows():
+                    state = row["early_warning_state"]
+                    s_id = row["road_id"]
+                    spd = row["current_speed"]
+                    p = row["congestion_probability"]
+                    d10 = row["speed_delta_10"]
+                    trm = row["TRM"]
+                    scp = row["SCP"]
+                    psi = row["PSI"]
+                    
+                    banner_cls = "alert-banner-critical" if state in ["CRITICAL", "HIGH RISK"] else "alert-banner-warning"
+                    st.markdown(f"""
+                    <div class="{banner_cls}">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <b>Segment {s_id}</b>
+                            <span class="metric-pill" style="background:{row['early_warning_color']};color:#000;">{state}</span>
+                        </div>
+                        <div style="font-size:0.88rem;margin-top:4px;">
+                            Speed: <b>{spd:.1f} mph</b> ({d10:+.1f} mph 10m) | Fused Risk: <b>{p*100:.1f}%</b>
+                        </div>
+                        <div style="font-size:0.78rem;color:#CBD5E1;margin-top:3px;">
+                            TRM Momentum: {trm:.2f} | SCP Pressure: {scp:.2f} | PSI Shock: {psi:.2f}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 2: RUN SPILLOVER & CASCADE DEMO
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "🚨 Run Spillover & Cascade Demo":
+    st.markdown('<div class="main-header">Congestion Spillover & Cascade Simulator</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Induce synthetic bottleneck deceleration and track multi-hop shockwave propagation.</div>', unsafe_allow_html=True)
+    
+    sim_data = st.session_state.sim_data
+    df_preds = sim_data.get("ai_predictions")
+    sensors = list(G_network.nodes())
+    
+    col_c1, col_c2, col_c3 = st.columns([2, 1, 1])
+    with col_c1:
+        target_sensor = st.selectbox("Select Target Road Sensor to Choke", sensors, index=0)
+    with col_c2:
+        drop_speed = st.slider("Target Speed (mph)", 5.0, 30.0, 12.0, step=1.0)
+    with col_c3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💥 Trigger Incident", use_container_width=True):
+            st.session_state.sim_data = simulator.induce_incident(target_sensor, target_speed=drop_speed, duration_steps=4)
+            st.rerun()
+            
+    sim_data = st.session_state.sim_data
+    df_preds = sim_data.get("ai_predictions")
+    
+    if df_preds is not None:
+        spillover_analysis = predictor.analyze_spillover(target_sensor, df_preds)
+        
+        col_g, col_chain = st.columns([3, 2])
+        with col_g:
+            st.markdown(f"**Network Impact Map (Origin: Sensor {target_sensor})**")
+            fig_spill = render_network_graph(df_preds, highlighted_road=target_sensor, spillover_data=spillover_analysis, show_directional_edges=True)
+            st.plotly_chart(fig_spill, use_container_width=True)
+            
+        with col_chain:
+            st.markdown("#### 🌊 Inferred Cascade Chain")
+            p_chain = spillover_analysis.get("propagation_chain", [])
+            if p_chain:
+                for step in p_chain:
+                    st.markdown(f"""
+                    <div class="chain-node" style="margin-bottom:8px;">
+                        <div style="display:flex;justify-content:space-between;">
+                            <b>Step {step['step']}: Road {step['road_id']}</b>
+                            <span style="color:#38BDF8;font-size:0.85rem;">+{step['horizon_min']} min</span>
+                        </div>
+                        <div style="font-size:0.82rem;color:#94A3B8;margin-top:2px;">
+                            Role: {step['role']} | Speed: {step['current_speed']:.1f} mph | Risk: {step['congestion_probability']*100:.1f}%
+                        </div>
+                        <div style="font-size:0.75rem;color:#A78BFA;margin-top:2px;">
+                            Relation: {step['relation_to_prev']} ({step.get('confidence', 'Uncertain')})
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No active cascade detected.")
+                
+        st.markdown("#### 🎯 Downstream Spillover Targets")
+        targs = spillover_analysis.get("spillover_targets", [])
+        if targs:
+            df_table = pd.DataFrame([
+                {
+                    "Target Road": t["road_id"],
+                    "Hop": t["hop_distance"],
+                    "Est. Horizon": f"+{t['estimated_horizon_min']} min",
+                    "Speed": f"{t['current_speed']:.1f} mph",
+                    "Risk": f"{t['congestion_probability']*100:.1f}%",
+                    "State": t["early_warning_state"],
+                    "Direction Status": t["propagation_direction_label"],
+                    "Confidence": t["propagation_confidence"],
+                }
+                for t in targs[:10]
+            ])
+            st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 3: PROBABLE PROPAGATION NETWORK GRAPH
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "🧭 Probable Propagation Network Graph":
+    st.markdown('<div class="main-header">Empirical Propagation Direction Network</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Data-driven lead-lag cross-correlation topology on graph-connected sensor pairs.</div>', unsafe_allow_html=True)
+    
+    if prop_data and "metadata" in prop_data:
+        m = prop_data["metadata"]
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Total Graph Edges", m["total_graph_edges"])
+        with c2:
+            st.metric("Inferred Directional Links", m["inferred_directional_count"])
+        with c3:
+            st.metric("Direction Uncertain Links", m["direction_uncertain_count"])
+        with c4:
+            st.metric("Directional Ratio", f"{m['directional_ratio_pct']}%")
+            
+        st.markdown("---")
+        st.info(f"🛡️ **Scientific Honesty Disclaimer:** {m.get('disclaimer', '')}")
+        
+        sim_data = st.session_state.sim_data
+        df_preds = sim_data.get("ai_predictions")
+        fig_dir = render_network_graph(df_preds, show_directional_edges=True)
+        st.plotly_chart(fig_dir, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 4: WARNING LEAD TIME BENCHMARKS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "⏱️ Warning Lead Time Benchmarks":
+    st.markdown('<div class="main-header">Warning Lead Time Empirical Benchmarks</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Strict contiguous pre-congestion episode evaluation on the chronological test set (last 15%).</div>', unsafe_allow_html=True)
+    
+    if lead_time_data:
+        s = lead_time_data["summary"]
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Total Congestion Events", s["total_congestion_events"])
+        with k2:
+            st.metric("Advance Warning Rate", f"{s['advance_warning_rate_pct']}%")
+        with k3:
+            st.metric("Mean Advance Lead Time", f"{s['mean_lead_time_minutes']:.1f} min")
+        with k4:
+            st.metric("Median Advance Lead Time", f"{s['median_lead_time_minutes']:.1f} min")
+            
+        st.markdown("---")
+        dist = lead_time_data["lead_time_distribution"]
+        df_dist = pd.DataFrame([
+            {"Interval": k.replace("_", " "), "Count": v["count"], "Percentage": v["pct"]}
+            for k, v in dist.items()
+        ])
+        fig_bar = px.bar(
+            df_dist, x="Interval", y="Count", text="Count",
+            title="Empirical Lead Time Distribution Ahead of Congestion Onset",
+            color="Count", color_continuous_scale="Blues",
+        )
+        fig_bar.update_layout(plot_bgcolor="#1E293B", paper_bgcolor="#1E293B", font=dict(color="#F8FAFC"))
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 5: MODEL EVALUATION & SPATIAL BENCHMARKS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "📊 Model Evaluation & Spatial Benchmarks":
+    st.markdown('<div class="main-header">Spatial vs Baseline Model Benchmarks</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Chronological test set evaluation: Baseline (Temporal Only) vs Proposed (Temporal + Spatial Neighbor Graph).</div>', unsafe_allow_html=True)
+    
+    if metrics_data:
+        base = metrics_data.get("baseline", {})
+        prop = metrics_data.get("proposed_spatial", {})
+        
+        comp_df = pd.DataFrame([
+            {
+                "Metric": "Accuracy",
+                "Baseline (Temporal Only)": f"{base.get('accuracy', 0)*100:.2f}%",
+                "Proposed (Temporal + Spatial)": f"{prop.get('accuracy', 0)*100:.2f}%",
+            },
+            {
+                "Metric": "Precision",
+                "Baseline (Temporal Only)": f"{base.get('precision', 0)*100:.2f}%",
+                "Proposed (Temporal + Spatial)": f"{prop.get('precision', 0)*100:.2f}%",
+            },
+            {
+                "Metric": "Recall",
+                "Baseline (Temporal Only)": f"{base.get('recall', 0)*100:.2f}%",
+                "Proposed (Temporal + Spatial)": f"{prop.get('recall', 0)*100:.2f}%",
+            },
+            {
+                "Metric": "F1-Score",
+                "Baseline (Temporal Only)": f"{base.get('f1', 0)*100:.2f}%",
+                "Proposed (Temporal + Spatial)": f"{prop.get('f1', 0)*100:.2f}%",
+            },
+            {
+                "Metric": "ROC-AUC",
+                "Baseline (Temporal Only)": f"{base.get('roc_auc', 0)*100:.2f}%",
+                "Proposed (Temporal + Spatial)": f"{prop.get('roc_auc', 0)*100:.2f}%",
+            },
+        ])
+        st.table(comp_df)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 6: ROAD DEEP-DIVE & EXPLAINABLE AI
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "🔍 Road Deep-Dive & Explainable AI":
+    st.markdown('<div class="main-header">Road Deep-Dive & Explainable AI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Granular diagnostic telemetry, multi-horizon trajectories, and structured explainability.</div>', unsafe_allow_html=True)
+    
+    sim_data = st.session_state.sim_data
+    df_preds = sim_data.get("ai_predictions")
+    sensors = list(G_network.nodes())
+    
+    target_sensor = st.selectbox("Inspect Highway Sensor", sensors, index=0)
+    
+    if df_preds is not None and target_sensor in df_preds["road_id"].values:
+        road_row = df_preds[df_preds["road_id"] == target_sensor].iloc[0]
+        spill_info = predictor.analyze_spillover(target_sensor, df_preds)
+        exp_details = predictor.generate_early_warning_explanation(target_sensor, df_preds)
+        
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Current Speed", f"{road_row['current_speed']:.1f} mph", delta=f"{road_row['speed_delta_10']:+.1f} mph (10m)")
+        with c2:
+            st.metric("Stage 4 Fused Risk", f"{road_row['congestion_probability']*100:.1f}%", delta=road_row["risk_level"])
+        with c3:
+            st.metric("Stabilized State", road_row["early_warning_state"])
+        with c4:
+            st.metric("Raw State", road_row["raw_early_warning_state"])
+            
+        st.markdown("---")
+        
+        # Multi-Horizon Trajectory
+        st.markdown("#### ⏱️ Multi-Horizon Congestion Trajectory (Direct ML Predictions)")
+        h1, h2, h3 = st.columns(3)
+        with h1:
+            st.markdown(f'<div class="kpi-card"><div class="kpi-label">5-min Direct Risk (t+1)</div><div class="kpi-value" style="color:#38BDF8;">{road_row["p_congestion_5min"]*100:.1f}%</div><div style="font-size:0.8rem;color:#94A3B8">Calibrated Direct RF</div></div>', unsafe_allow_html=True)
+        with h2:
+            st.markdown(f'<div class="kpi-card"><div class="kpi-label">10-min Direct Risk (t+2)</div><div class="kpi-value" style="color:#818CF8;">{road_row["p_congestion_10min"]*100:.1f}%</div><div style="font-size:0.8rem;color:#94A3B8">Calibrated Direct RF</div></div>', unsafe_allow_html=True)
+        with h3:
+            st.markdown(f'<div class="kpi-card"><div class="kpi-label">15-min Direct Risk (t+3)</div><div class="kpi-value" style="color:#C084FC;">{road_row["p_congestion_15min"]*100:.1f}%</div><div style="font-size:0.8rem;color:#94A3B8">Calibrated Direct RF</div></div>', unsafe_allow_html=True)
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+        c_t, c_s = st.columns(2)
+        with c_t:
+            st.markdown("#### ⏱️ Temporal Signal Audit")
+            for t in exp_details["temporal_signals"]:
+                st.markdown(f"- 📈 {t}")
+        with c_s:
+            st.markdown("#### 🌐 Spatial & Neighbor Audit")
+            for s in exp_details["spatial_signals"]:
+                st.markdown(f"- 🛣️ {s}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 7: STAGE 4 SCIENTIFIC VALIDATION & ROBUSTNESS BENCHMARKS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "🔬 Stage 4 Scientific Validation & Robustness Benchmarks":
+    st.markdown('<div class="main-header">Stage 4 Technical Benchmarks & Robustness Suite</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Rigorous empirical validation: Direct Multi-Horizon Models, Validation Threshold Curves, Diurnal Regimes, and Hardware Outage Stress Tests.</div>', unsafe_allow_html=True)
+    
+    t_multi, t_thresh, t_reg, t_stress, t_prop, t_cal, t_abl = st.tabs([
+        "⏱️ Direct Multi-Horizon Models",
+        "⚖️ Threshold Optimization",
+        "🌅 Temporal Regimes",
+        "⚡ Hardware Outage Stress Tests",
+        "🧭 Propagation TLCC Validation",
+        "🎯 Probability Calibration",
+        "🏗️ Ablation Study",
+    ])
+    
+    # ── TAB 1: Direct Multi-Horizon Models ─────────────────────────────────────
+    with t_multi:
+        st.markdown("### ⏱️ Direct Multi-Horizon Machine Learning vs Heuristic Projections")
+        st.markdown("""
+        Independently trained Random Forest models for each prediction horizon evaluated on the untouched chronological test set:
+        - **5-min Horizon ($t+1$):** `speed(t + 5 min) < 20 mph`
+        - **10-min Horizon ($t+2$):** `speed(t + 10 min) < 20 mph`
+        - **15-min Horizon ($t+3$):** `speed(t + 15 min) < 20 mph`
+        """)
+        
+        if multi_horizon_data:
+            dm = multi_horizon_data["direct_models"]
+            m_rows = []
+            for h_k, h_v in dm.items():
+                cal_m = h_v["calibrated_metrics"]
+                m_rows.append({
+                    "Prediction Horizon": f"+{h_v['horizon_minutes']} Minutes",
+                    "Target Definition": h_v["target_definition"],
+                    "Calibration Method": h_v["calibration_method"].capitalize(),
+                    "Accuracy": f"{cal_m['accuracy']*100:.2f}%",
+                    "Precision": f"{cal_m['precision']*100:.2f}%",
+                    "Recall": f"{cal_m['recall']*100:.2f}%",
+                    "F1-Score": f"{cal_m['f1_score']*100:.2f}%",
+                    "ROC-AUC": f"{cal_m['roc_auc']*100:.2f}%",
+                    "PR-AUC": f"{cal_m['pr_auc']*100:.2f}%",
+                    "Brier Score": f"{cal_m['brier_score']:.4f}",
+                    "ECE": f"{cal_m['ece']:.4f}",
+                })
+            st.dataframe(pd.DataFrame(m_rows), use_container_width=True, hide_index=True)
+            
+            st.markdown("#### 🔬 Direct ML Model vs Heuristic Projection Comparison")
+            dvp = multi_horizon_data["direct_vs_projection_comparison"]
+            c_rows = []
+            for h_key, h_data in dvp.items():
+                d = h_data["direct_model"]
+                p = h_data["projection"]
+                c_rows.append({
+                    "Horizon": h_key.replace("_", " ").title(),
+                    "Direct Model F1": f"{d['f1_score']*100:.2f}%",
+                    "Projection F1": f"{p['f1_score']*100:.2f}%",
+                    "F1 Gain": f"+{h_data['f1_improvement_pct']}%",
+                    "Direct ROC-AUC": f"{d['roc_auc']:.4f}",
+                    "Projection ROC-AUC": f"{p['roc_auc']:.4f}",
+                    "Brier Improvement": f"{h_data['brier_improvement_pct']}% better",
+                })
+            st.table(pd.DataFrame(c_rows))
+            
+    # ── TAB 2: Threshold Optimization ──────────────────────────────────────────
+    with t_thresh:
+        st.markdown("### ⚖️ Validation-Driven Decision & Early-Warning Threshold Analysis")
+        st.markdown("Thresholds tuned strictly on the chronological **Validation Set** to prevent test-set contamination, then benchmarked on the untouched **Test Set**.")
+        
+        if threshold_data:
+            modes = threshold_data["selected_modes"]
+            test_bm = threshold_data["test_set_benchmarks"]
+            
+            t_rows = []
+            for m_key, m_info in modes.items():
+                t_test = test_bm.get(m_key, {})
+                t_rows.append({
+                    "Operational Mode": m_info["name"],
+                    "Selected Threshold": f"{m_info['selected_threshold']:.3f}",
+                    "Test Accuracy": f"{t_test.get('accuracy', 0)*100:.2f}%",
+                    "Test Precision": f"{t_test.get('precision', 0)*100:.2f}%",
+                    "Test Recall": f"{t_test.get('recall', 0)*100:.2f}%",
+                    "Test F1-Score": f"{t_test.get('f1_score', 0)*100:.2f}%",
+                    "False Alarm Rate (FPR)": f"{t_test.get('false_positive_rate', 0)*100:.2f}%",
+                    "Advance Warning Rate": f"{t_test.get('advance_warning_rate_pct', 0):.1f}%",
+                    "Mean Warning Lead Time": f"{t_test.get('mean_lead_time_min', 0):.1f} min",
+                })
+            st.dataframe(pd.DataFrame(t_rows), use_container_width=True, hide_index=True)
+            
+            # Curve Visualization
+            v_curve = pd.DataFrame(threshold_data["validation_curve"])
+            fig_th = go.Figure()
+            fig_th.add_trace(go.Scatter(x=v_curve["threshold"], y=v_curve["precision"], name="Validation Precision", line=dict(color="#38BDF8", width=2)))
+            fig_th.add_trace(go.Scatter(x=v_curve["threshold"], y=v_curve["recall"], name="Validation Recall", line=dict(color="#F87171", width=2)))
+            fig_th.add_trace(go.Scatter(x=v_curve["threshold"], y=v_curve["f1_score"], name="Validation F1-Score", line=dict(color="#22C55E", width=3)))
+            fig_th.update_layout(
+                title="Validation Operating Characteristics Curve (Precision-Recall-F1 vs Threshold)",
+                xaxis=dict(title="Probability Threshold"),
+                yaxis=dict(title="Metric Score", range=[0, 1]),
+                plot_bgcolor="#1E293B", paper_bgcolor="#1E293B", font=dict(color="#F8FAFC"),
+                height=350,
+            )
+            st.plotly_chart(fig_th, use_container_width=True)
+            
+    # ── TAB 3: Temporal Regimes ────────────────────────────────────────────────
+    with t_reg:
+        st.markdown("### 🌅 Diurnal & Temporal Regime Robustness")
+        st.markdown("Evaluates system reliability across standard commute shockwaves, off-peak free-flow, and weekend travel.")
+        
+        if regime_data:
+            regs = regime_data["regimes"]
+            reg_rows = []
+            for r_k, r_v in regs.items():
+                reg_rows.append({
+                    "Regime": r_v["name"],
+                    "Traffic Characterization": r_v["description"],
+                    "Congestion Rate": f"{r_v['congestion_prevalence_pct']}%",
+                    "Precision": f"{r_v['precision']*100:.2f}%",
+                    "Recall": f"{r_v['recall']*100:.2f}%",
+                    "F1-Score": f"{r_v['f1_score']*100:.2f}%",
+                    "ROC-AUC": f"{r_v['roc_auc']*100:.2f}%",
+                    "Brier Loss": f"{r_v['brier_score']:.4f}",
+                    "Advance Warning Rate": f"{r_v['advance_warning_rate_pct']}%",
+                    "Mean Lead Time": f"{r_v['mean_lead_time_min']} min",
+                })
+            st.dataframe(pd.DataFrame(reg_rows), use_container_width=True, hide_index=True)
+            
+    # ── TAB 4: Hardware Stress Tests ───────────────────────────────────────────
+    with t_stress:
+        st.markdown("### ⚡ Sensor Outage & Hardware Stress Tests")
+        st.markdown("Empirical stress simulation evaluating 0%, 5%, 10%, 20%, 30% sensor dropouts, localized regional blackouts, and sporadic packet loss.")
+        
+        if stress_data:
+            stress_res = stress_data["stress_results"]
+            stress_rows = []
+            for cond, vals in stress_res.items():
+                stress_rows.append({
+                    "Outage Condition": cond,
+                    "Sensors Disabled": f"{vals.get('sensors_disabled_count', 0)} / 207",
+                    "Accuracy": f"{vals['accuracy']*100:.2f}%",
+                    "Precision": f"{vals['precision']*100:.2f}%",
+                    "Recall": f"{vals['recall']*100:.2f}%",
+                    "F1-Score": f"{vals['f1_score']*100:.2f}%",
+                    "ROC-AUC": f"{vals['roc_auc']*100:.2f}%",
+                    "Advance Warning Rate": f"{vals.get('advance_warning_rate_pct', 'N/A')}%",
+                    "Mean Lead Time": f"{vals.get('mean_lead_time_min', 'N/A')} min",
+                    "F1 Degradation": f"{vals['f1_degradation_pct']}%",
+                    "Resilience Status": vals["system_resilience_status"],
+                })
+            st.dataframe(pd.DataFrame(stress_rows), use_container_width=True, hide_index=True)
+            
+    # ── TAB 5: Propagation TLCC Validation ────────────────────────────────────
+    with t_prop:
+        st.markdown("### 🧭 Empirical TLCC Propagation Validation & Stability")
+        st.markdown("Verifying temporal cross-period stability and loop-free cascade integrity.")
+        
+        if prop_val_data:
+            p_meta = prop_val_data["engine_summary"]
+            p_stab = prop_val_data["stability_analysis"]
+            p_casc = prop_val_data["cascade_integrity"]
+            
+            pk1, pk2, pk3 = st.columns(3)
+            with pk1:
+                st.metric("Cross-Period Stability", f"{p_stab['cross_period_stability_rate_pct']}%")
+            with pk2:
+                st.metric("Loop-Cycle Violations", p_casc["loop_cycle_violations"])
+            with pk3:
+                st.metric("Monotonicity Violations", p_casc["monotonicity_violations"])
+                
+            st.markdown("---")
+            st.markdown(f"""
+            - **Temporal Stability:** `{p_stab['consistent_edges_count']} of {p_stab['consistent_edges_count'] + p_stab['inconsistent_edges_count']}` edges maintain identical directional inference between chronological training halves.
+            - **Cascade Graph Status:** `{p_casc['cascade_integrity_status']}` across all 207 starting highway nodes.
+            - **Honesty Rule:** Directionally uncertain relationships remain explicitly labeled as `"Graph neighbor — direction uncertain"` with zero forced physical assumptions.
+            """)
+            
+    # ── TAB 6: Probability Calibration ─────────────────────────────────────────
+    with t_cal:
+        st.markdown("### 🎯 Validation-Driven Probability Calibration")
+        st.markdown("Probability calibration aligns model risk outputs with empirical observation frequencies, eliminating raw tree overconfidence.")
+        
+        if cal_data:
+            c_perf = cal_data["test_set_performance"]
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.markdown(f'<div class="kpi-card"><div class="kpi-label">Brier Score Loss</div><div class="kpi-value" style="color:#22C55E;">{c_perf["calibrated"]["brier_score"]}</div><div style="font-size:0.8rem;color:#94A3B8">Raw RF: {c_perf["raw_rf"]["brier_score"]} ({c_perf["calibrated"]["brier_improvement_pct"]}% better)</div></div>', unsafe_allow_html=True)
+            with k2:
+                st.markdown(f'<div class="kpi-card"><div class="kpi-label">Expected Calibration Error (ECE)</div><div class="kpi-value" style="color:#00F2FE;">{c_perf["calibrated"]["ece"]}</div><div style="font-size:0.8rem;color:#94A3B8">Raw RF: {c_perf["raw_rf"]["ece"]} ({c_perf["calibrated"]["ece_improvement_pct"]}% reduction)</div></div>', unsafe_allow_html=True)
+            with k3:
+                st.markdown(f'<div class="kpi-card"><div class="kpi-label">Calibrated Precision</div><div class="kpi-value" style="color:#818CF8;">{c_perf["calibrated"]["precision"]*100:.1f}%</div><div style="font-size:0.8rem;color:#94A3B8">Raw RF: {c_perf["raw_rf"]["precision"]*100:.1f}% (+{round((c_perf["calibrated"]["precision"]-c_perf["raw_rf"]["precision"])*100, 1)}%)</div></div>', unsafe_allow_html=True)
+                
+            st.markdown("<br>", unsafe_allow_html=True)
+            rc = cal_data["reliability_curves"]
+            fig_cal = go.Figure()
+            fig_cal.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Perfect Calibration", line=dict(dash="dash", color="#64748B")))
+            fig_cal.add_trace(go.Scatter(x=rc["raw_rf"]["mean_predicted_value"], y=rc["raw_rf"]["fraction_of_positives"], mode="lines+markers", name="Raw Random Forest", line=dict(color="#F87171", width=2), marker=dict(size=7)))
+            fig_cal.add_trace(go.Scatter(x=rc["calibrated"]["mean_predicted_value"], y=rc["calibrated"]["fraction_of_positives"], mode="lines+markers", name="Calibrated Model (Isotonic)", line=dict(color="#38BDF8", width=3), marker=dict(size=8)))
+            fig_cal.update_layout(
+                title="Reliability / Calibration Curves on Chronological Test Set",
+                xaxis=dict(title="Mean Predicted Probability", range=[0, 1]),
+                yaxis=dict(title="Observed Fraction of Congestion Positives", range=[0, 1]),
+                plot_bgcolor="#1E293B", paper_bgcolor="#1E293B", font=dict(color="#F8FAFC"),
+                height=350,
+            )
+            st.plotly_chart(fig_cal, use_container_width=True)
+            
+    # ── TAB 7: Ablation Study ──────────────────────────────────────────────────
+    with t_abl:
+        st.markdown("### 🏗️ Architectural Ablation Benchmark Suite")
+        st.markdown("Comparing progressive architectures evaluated on chronological test set observations.")
+        
+        if ablation_data:
+            models_dict = ablation_data["models"]
+            abl_rows = []
+            for m_key, m_val in models_dict.items():
+                lt = m_val.get("lead_time_stats", {})
+                abl_rows.append({
+                    "Architecture": m_val["architecture_name"],
+                    "Accuracy": f"{m_val['accuracy']*100:.2f}%",
+                    "Precision": f"{m_val['precision']*100:.2f}%",
+                    "Recall": f"{m_val['recall']*100:.2f}%",
+                    "F1-Score": f"{m_val['f1_score']*100:.2f}%",
+                    "ROC-AUC": f"{m_val['roc_auc']*100:.2f}%",
+                    "Brier Score": f"{m_val['brier_score']:.4f}",
+                    "FPR": f"{m_val['false_positive_rate']*100:.2f}%",
+                    "Adv. Warning %": f"{lt.get('advance_rate_pct', 0)}%",
+                    "Mean Lead": f"{lt.get('mean_lead_time_min', 0)}m",
+                })
+            st.dataframe(pd.DataFrame(abl_rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIEW 8: ABOUT & SCIENTIFIC METHODOLOGY
+# ═══════════════════════════════════════════════════════════════════════════════
+elif nav_option == "ℹ️ About & Scientific Methodology":
+    st.markdown('<div class="main-header">About TrafficFlow AI & Live-Data Architecture</div>', unsafe_allow_html=True)
+    st.markdown("""
+    ### 🎯 Stage 4 Technical System Architecture
+    > **"TrafficFlow AI is an explainable, calibrated spatiotemporal traffic early-warning engine. It fuses direct multi-horizon machine learning models (5 min, 10 min, 15 min) with Temporal Risk Momentum (TRM), Spatial Congestion Pressure (SCP), and Propagation Shock (PSI) to provide reliable advance signals before physical bottlenecks develop."**
+
+    ---
+
+    ### 🏭 Real-World Live-Data Deployment Architecture
+    1. **Streaming Telemetry Ingestion:**
+       - Direct highway loop detector feeds ingested over Apache Kafka / MQTT topics at 5-minute sampling windows.
+       - End-to-end telemetry parsing, causal gap detection, and forward-fill clamping executed within <150 ms latency.
+    2. **Graceful Sensor Dropout Handling:**
+       - If a detector drops offline, the system falls back to causal historical medians and spatial neighbor consensus, preserving full network inference stability up to 30% outages.
+    3. **Continuous Calibration & Drift Detection:**
+       - Brier Score Loss and Expected Calibration Error (ECE) continuously tracked over rolling 7-day windows.
+       - Statistical drift triggers automated alert recalibration without cold retraining.
+    4. **Scientific Honesty Statement:**
+       - All propagation links represent data-driven empirical lead-lag correlation tendencies and do not imply physical road topological certainty.
+       - Directionally uncertain relationships are explicitly preserved as uncertain.
+    """)

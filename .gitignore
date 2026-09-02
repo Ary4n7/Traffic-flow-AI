@@ -1,0 +1,8 @@
+# Large data and model files
+*.pkl
+*.h5
+*.parquet
+data/raw/
+models/
+__pycache__/
+.DS_Store

@@ -1,0 +1,798 @@
+"""
+src/predictor.py
+----------------
+STAGE 4 — Spatiotemporal Traffic Risk & Multi-Horizon Early-Warning Engine.
+
+Combines:
+1. Direct Multi-Horizon Calibrated ML Models (5 min, 10 min, 15 min direct predictions)
+2. Temporal Risk Momentum (TRM)
+3. Spatial Congestion Pressure (SCP)
+4. Propagation Shock-Wave Index (PSI)
+5. Integrated Stage 3/4 Risk Fusion
+6. Alert Hysteresis & Debouncing Filter (Raw State vs Stabilized State)
+7. Multi-Hop Cascades & Structured Temporal/Spatial Explainability
+"""
+
+import os
+import sys
+import json
+import pickle
+import logging
+from collections import deque
+import numpy as np
+import pandas as pd
+import networkx as nx
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
+from src.feature_engineering import TEMPORAL_FEATURE_NAMES
+from src.graph_builder import SPATIAL_FEATURE_NAMES
+from src.propagation_direction import PropagationDirectionEngine
+from src.spatiotemporal_metrics import (
+    compute_all_spatiotemporal_metrics,
+    compute_temporal_risk_momentum,
+    compute_spatial_congestion_pressure,
+    compute_propagation_shock_index,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
+log = logging.getLogger("predictor")
+
+
+STATE_SEVERITY_ORDER = {
+    "NORMAL": 0,
+    "WATCH": 1,
+    "WARNING": 2,
+    "HIGH RISK": 3,
+    "CRITICAL": 4,
+}
+SEVERITY_TO_STATE = {v: k for k, v in STATE_SEVERITY_ORDER.items()}
+
+
+class SpilloverPredictor:
+    def __init__(
+        self,
+        model_path: str = config.SPATIAL_MODEL_PKL,
+        calibrated_model_path: str = getattr(config, "CALIBRATED_MODEL_PKL", os.path.join(config.MODELS_DIR, "calibrated_model.pkl")),
+        graph_path: str = config.ADJACENCY_PKL,
+        meta_path: str = config.FEATURE_META_JSON,
+        propagation_path: str = config.PROPAGATION_JSON,
+    ):
+        """Load base RF model, calibrated models (5m, 10m, 15m), graph topology, and direction engine."""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at {model_path}. Run model_training.py first.")
+        if not os.path.exists(graph_path):
+            raise FileNotFoundError(f"Graph file not found at {graph_path}.")
+            
+        with open(model_path, "rb") as f:
+            self.model = pickle.load(f)
+            
+        # Load calibrated 5m model if available, fallback to base model
+        if os.path.exists(calibrated_model_path):
+            try:
+                with open(calibrated_model_path, "rb") as f:
+                    self.calibrated_model = pickle.load(f)
+                log.info("Loaded calibrated model from %s", calibrated_model_path)
+            except Exception as e:
+                log.warning("Could not load calibrated model (%s), using base RF.", e)
+                self.calibrated_model = self.model
+        else:
+            self.calibrated_model = self.model
+            
+        # Load direct 10-min and 15-min models (Stage 4)
+        cal_10m_path = getattr(config, "CALIBRATED_MODEL_10MIN_PKL", os.path.join(config.MODELS_DIR, "calibrated_10min.pkl"))
+        cal_15m_path = getattr(config, "CALIBRATED_MODEL_15MIN_PKL", os.path.join(config.MODELS_DIR, "calibrated_15min.pkl"))
+        
+        self.calibrated_model_10min = None
+        if os.path.exists(cal_10m_path):
+            try:
+                with open(cal_10m_path, "rb") as f:
+                    self.calibrated_model_10min = pickle.load(f)
+                log.info("Loaded direct 10-min calibrated model from %s", cal_10m_path)
+            except Exception as e:
+                log.warning("Could not load direct 10-min model (%s).", e)
+                
+        self.calibrated_model_15min = None
+        if os.path.exists(cal_15m_path):
+            try:
+                with open(cal_15m_path, "rb") as f:
+                    self.calibrated_model_15min = pickle.load(f)
+                log.info("Loaded direct 15-min calibrated model from %s", cal_15m_path)
+            except Exception as e:
+                log.warning("Could not load direct 15-min model (%s).", e)
+            
+        with open(graph_path, "rb") as f:
+            self.graph = pickle.load(f)
+            
+        with open(meta_path, "r") as f:
+            self.metadata = json.load(f)
+            
+        self.feature_names = self.metadata["all_features"]
+        self.congestion_threshold = self.metadata.get("congestion_threshold_mph", config.CONGESTION_THRESHOLD_MPH)
+        
+        # Load propagation direction engine
+        try:
+            self.prop_engine = PropagationDirectionEngine(artifact_path=propagation_path)
+        except Exception as e:
+            log.warning("Could not initialize PropagationDirectionEngine: %s. Using default topology.", e)
+            self.prop_engine = None
+            
+        # Hysteresis state tracking per sensor: sensor_id -> {"current_state": "NORMAL", "patience_counter": 0, "candidate_state": None}
+        self.sensor_hysteresis_state = {}
+        self.prev_rf_probs = {}
+        
+        log.info("SpilloverPredictor (Stage 4 Multi-Horizon Production Engine) initialized successfully.")
+
+    def get_risk_level(self, prob: float) -> str:
+        """Map probability to 4-tier risk level."""
+        for level, (low, high) in config.RISK_THRESHOLDS.items():
+            if low <= prob <= high:
+                return level
+        return "CRITICAL" if prob > 0.8 else "LOW"
+
+    def classify_early_warning_state(
+        self,
+        current_speed: float,
+        prob: float,
+        speed_delta_5: float = 0.0,
+        speed_delta_10: float = 0.0,
+        rolling_trend: float = 0.0,
+    ) -> str:
+        """
+        Classify operational early-warning state based on speed dynamics and model probability.
+        """
+        if current_speed < self.congestion_threshold:
+            return "CRITICAL"
+        elif prob >= 0.85:
+            return "CRITICAL"
+        elif prob >= 0.70:
+            return "HIGH RISK"
+        elif prob >= 0.50 or speed_delta_10 <= -10.0 or speed_delta_5 <= -7.0:
+            return "WARNING"
+        elif prob >= 0.30 or speed_delta_10 <= -5.0 or rolling_trend <= -6.0:
+            return "WATCH"
+        else:
+            return "NORMAL"
+
+    def apply_alert_hysteresis(
+        self,
+        sensor_id: str,
+        raw_state: str,
+        raw_prob: float,
+    ) -> str:
+        """
+        Apply temporal hysteresis/debouncing to prevent rapid state flickering.
+        
+        Rules:
+        1. Fast Escalation: If new state is higher severity, escalate with patience=1 (immediate for Critical/High Risk).
+        2. Sustained Recovery: If new state is lower severity, require HYSTERESIS_DOWNGRADE_PATIENCE consecutive steps.
+        3. Threshold Deadband: Slight probability margin suppresses flickering near boundaries.
+        """
+        if not getattr(config, "HYSTERESIS_ENABLED", True):
+            return raw_state
+            
+        sensor_id = str(sensor_id)
+        if sensor_id not in self.sensor_hysteresis_state:
+            self.sensor_hysteresis_state[sensor_id] = {
+                "stabilized_state": raw_state,
+                "candidate_state": raw_state,
+                "consecutive_steps": 0,
+            }
+            return raw_state
+            
+        tracker = self.sensor_hysteresis_state[sensor_id]
+        current_stab = tracker["stabilized_state"]
+        
+        curr_sev = STATE_SEVERITY_ORDER.get(current_stab, 0)
+        raw_sev = STATE_SEVERITY_ORDER.get(raw_state, 0)
+        
+        if raw_sev > curr_sev:
+            # Escalation
+            patience = config.HYSTERESIS_UPGRADE_PATIENCE
+            # Immediate escalation for Critical
+            if raw_sev == 4:
+                tracker["stabilized_state"] = raw_state
+                tracker["candidate_state"] = raw_state
+                tracker["consecutive_steps"] = 0
+                return raw_state
+                
+            if tracker["candidate_state"] == raw_state:
+                tracker["consecutive_steps"] += 1
+            else:
+                tracker["candidate_state"] = raw_state
+                tracker["consecutive_steps"] = 1
+                
+            if tracker["consecutive_steps"] >= patience:
+                tracker["stabilized_state"] = raw_state
+                tracker["consecutive_steps"] = 0
+                
+        elif raw_sev < curr_sev:
+            # De-escalation (Requires stronger evidence of recovery)
+            patience = config.HYSTERESIS_DOWNGRADE_PATIENCE
+            if tracker["candidate_state"] == raw_state:
+                tracker["consecutive_steps"] += 1
+            else:
+                tracker["candidate_state"] = raw_state
+                tracker["consecutive_steps"] = 1
+                
+            if tracker["consecutive_steps"] >= patience:
+                tracker["stabilized_state"] = raw_state
+                tracker["consecutive_steps"] = 0
+        else:
+            # Same state
+            tracker["candidate_state"] = raw_state
+            tracker["consecutive_steps"] = 0
+            
+        return tracker["stabilized_state"]
+
+    def get_state_color(self, state: str) -> str:
+        """Return hex color for early warning state."""
+        state_cfg = config.EARLY_WARNING_STATES.get(state)
+        return state_cfg["color"] if state_cfg else "#94A3B8"
+
+    def predict_network(
+        self,
+        current_speeds: pd.Series,
+        speed_history: pd.DataFrame, # Recent history (at least 4 steps)
+        timestamp: pd.Timestamp = None,
+    ) -> pd.DataFrame:
+        """
+        Compute full Stage 4 predictions: raw RF, calibrated probability, TRM, SCP, PSI,
+        fused risk, raw early-warning state, stabilized hysteresis state, and multi-horizon direct models & projections.
+        """
+        if timestamp is None:
+            timestamp = pd.Timestamp.now()
+            
+        sensors = list(self.graph.nodes())
+        
+        # Precompute spatial neighbor stats for speed
+        neigh_speeds_mean = {}
+        neigh_speeds_min = {}
+        neigh_speeds_max = {}
+        neigh_cong_count = {}
+        neigh_cong_ratio = {}
+        neigh_total_count = {}
+        
+        for s in sensors:
+            neighbors = list(self.graph.neighbors(s))
+            neigh_total_count[s] = len(neighbors)
+            if not neighbors:
+                neighbors = [s]
+            n_vals = [float(current_speeds.get(n, 55.0)) for n in neighbors]
+            n_cong = [1 if v < self.congestion_threshold else 0 for v in n_vals]
+            
+            neigh_speeds_mean[s] = float(np.mean(n_vals))
+            neigh_speeds_min[s] = float(np.min(n_vals))
+            neigh_speeds_max[s] = float(np.max(n_vals))
+            neigh_cong_count[s] = float(np.sum(n_cong))
+            neigh_cong_ratio[s] = float(np.mean(n_cong))
+            
+        # Build feature matrix for all sensors
+        feature_rows = []
+        delta_5_dict = {}
+        delta_10_dict = {}
+        roll_mean_dict = {}
+        roll_trend_dict = {}
+        curr_speeds_dict = {}
+        
+        for s in sensors:
+            s_curr = float(current_speeds.get(s, 55.0))
+            curr_speeds_dict[s] = s_curr
+            
+            # Lagged speeds from history if available
+            if len(speed_history) >= 4 and s in speed_history.columns:
+                s_t5 = float(speed_history[s].iloc[-2])
+                s_t10 = float(speed_history[s].iloc[-3])
+                s_t15 = float(speed_history[s].iloc[-4])
+                s_roll_mean = float(speed_history[s].iloc[-6:].mean())
+                s_roll_trend = float(s_curr - speed_history[s].iloc[-6]) if len(speed_history) >= 6 else 0.0
+            else:
+                s_t5 = s_curr
+                s_t10 = s_curr
+                s_t15 = s_curr
+                s_roll_mean = s_curr
+                s_roll_trend = 0.0
+                
+            delta_5 = s_curr - s_t5
+            delta_10 = s_curr - s_t10
+            
+            delta_5_dict[s] = delta_5
+            delta_10_dict[s] = delta_10
+            roll_mean_dict[s] = s_roll_mean
+            roll_trend_dict[s] = s_roll_trend
+            
+            # Calendar
+            hr = timestamp.hour
+            dow = timestamp.dayofweek
+            is_wknd = 1 if dow >= 5 else 0
+            
+            # Spatial
+            n_mean = neigh_speeds_mean[s]
+            n_min = neigh_speeds_min[s]
+            n_max = neigh_speeds_max[s]
+            n_count = neigh_cong_count[s]
+            n_ratio = neigh_cong_ratio[s]
+            n_delta = s_curr - n_mean
+            
+            feat_dict = {
+                "speed_t": s_curr,
+                "speed_t_minus_5": s_t5,
+                "speed_t_minus_10": s_t10,
+                "speed_t_minus_15": s_t15,
+                "speed_delta_5": delta_5,
+                "speed_delta_10": delta_10,
+                "rolling_mean_30min": s_roll_mean,
+                "rolling_trend_30min": s_roll_trend,
+                "hour": hr,
+                "day_of_week": dow,
+                "is_weekend": is_wknd,
+                "neighbor_mean_speed": n_mean,
+                "neighbor_min_speed": n_min,
+                "neighbor_max_speed": n_max,
+                "neighbor_congested_count": n_count,
+                "neighbor_congestion_ratio": n_ratio,
+                "neighbor_speed_delta": n_delta,
+            }
+            feature_rows.append([feat_dict[k] for k in self.feature_names])
+            
+        X = np.array(feature_rows, dtype=np.float32)
+        
+        # 1. Base Raw RF Probability (5m)
+        raw_probs = self.model.predict_proba(X)[:, 1]
+        
+        # 2. Calibrated Probability (5m)
+        try:
+            cal_probs = self.calibrated_model.predict_proba(X)[:, 1]
+        except Exception:
+            cal_probs = raw_probs
+            
+        # 3. Direct Multi-Horizon Calibrated Probabilities (10m & 15m)
+        if self.calibrated_model_10min is not None:
+            try:
+                p_10min_direct = self.calibrated_model_10min.predict_proba(X)[:, 1]
+            except Exception:
+                p_10min_direct = cal_probs
+        else:
+            p_10min_direct = cal_probs
+            
+        if self.calibrated_model_15min is not None:
+            try:
+                p_15min_direct = self.calibrated_model_15min.predict_proba(X)[:, 1]
+            except Exception:
+                p_15min_direct = cal_probs
+        else:
+            p_15min_direct = cal_probs
+            
+        raw_probs_dict = {sensors[i]: float(raw_probs[i]) for i in range(len(sensors))}
+        cal_probs_dict = {sensors[i]: float(cal_probs[i]) for i in range(len(sensors))}
+        
+        # 4. Spatiotemporal Metrics (TRM, SCP, PSI)
+        st_metrics = compute_all_spatiotemporal_metrics(
+            sensor_ids=sensors,
+            graph=self.graph,
+            prop_engine=self.prop_engine,
+            current_speeds=curr_speeds_dict,
+            current_rf_probs=raw_probs_dict,
+            prev_rf_probs=self.prev_rf_probs if self.prev_rf_probs else None,
+            speed_delta_5=delta_5_dict,
+            speed_delta_10=delta_10_dict,
+            rolling_trend_30=roll_trend_dict,
+        )
+        
+        # 5. Stage 3/4 Integrated Risk Fusion
+        weights = getattr(config, "STAGE3_FUSION_WEIGHTS", {
+            "w_model_prob": 0.55, "w_trm": 0.20, "w_scp": 0.15, "w_psi": 0.10
+        })
+        
+        stage3_risk_probs = []
+        trm_list = []
+        scp_list = []
+        psi_list = []
+        
+        for i, s in enumerate(sensors):
+            p_c = cal_probs_dict[s]
+            m = st_metrics[s]
+            trm_list.append(m["TRM"])
+            scp_list.append(m["SCP"])
+            psi_list.append(m["PSI"])
+            
+            fused_risk = np.clip(
+                weights["w_model_prob"] * p_c +
+                weights["w_trm"] * m["TRM"] +
+                weights["w_scp"] * m["SCP"] +
+                weights["w_psi"] * m["PSI"],
+                0.0, 1.0
+            )
+            stage3_risk_probs.append(float(fused_risk))
+            
+        stage3_risk_probs = np.array(stage3_risk_probs, dtype=np.float32)
+        
+        # 6. Multi-Horizon Direct ML vs Projections
+        p_5min = cal_probs
+        p_10min = p_10min_direct
+        p_15min = p_15min_direct
+        
+        p_proj_10min = np.clip(cal_probs * 0.90 + 0.10 * np.array(trm_list), 0.0, 1.0)
+        p_proj_15min = np.clip(cal_probs * 0.82 + 0.18 * np.array(scp_list), 0.0, 1.0)
+        
+        # 7. Early Warning States (Raw vs Stabilized Hysteresis)
+        raw_early_states = []
+        stabilized_early_states = []
+        
+        for i, s in enumerate(sensors):
+            spd = curr_speeds_dict[s]
+            # Use Stage 3/4 fused risk for state classification
+            p_fused = stage3_risk_probs[i]
+            d5 = delta_5_dict[s]
+            d10 = delta_10_dict[s]
+            trend = roll_trend_dict[s]
+            
+            raw_st = self.classify_early_warning_state(spd, p_fused, d5, d10, trend)
+            stab_st = self.apply_alert_hysteresis(s, raw_st, p_fused)
+            
+            raw_early_states.append(raw_st)
+            stabilized_early_states.append(stab_st)
+            
+        # Update prev prob buffer for velocity
+        self.prev_rf_probs = raw_probs_dict.copy()
+        
+        df_results = pd.DataFrame({
+            "road_id": sensors,
+            "current_speed": [curr_speeds_dict[s] for s in sensors],
+            "is_currently_congested": [curr_speeds_dict[s] < self.congestion_threshold for s in sensors],
+            "raw_rf_probability": raw_probs,
+            "calibrated_probability": cal_probs,
+            "congestion_probability": stage3_risk_probs, # Primary Stage 3/4 Fused Risk
+            "stage3_risk_probability": stage3_risk_probs,
+            "predicted_congestion": (stage3_risk_probs >= 0.5).astype(int),
+            "risk_level": [self.get_risk_level(p) for p in stage3_risk_probs],
+            "raw_early_warning_state": raw_early_states,
+            "early_warning_state": stabilized_early_states, # Stabilized as primary
+            "stabilized_early_warning_state": stabilized_early_states,
+            "early_warning_color": [self.get_state_color(st) for st in stabilized_early_states],
+            "TRM": trm_list,
+            "SCP": scp_list,
+            "PSI": psi_list,
+            "p_congestion_5min": p_5min,
+            "p_congestion_10min": p_10min,
+            "p_congestion_15min": p_15min,
+            "p_projection_10min": p_proj_10min,
+            "p_projection_15min": p_proj_15min,
+            "speed_delta_5": [delta_5_dict[s] for s in sensors],
+            "speed_delta_10": [delta_10_dict[s] for s in sensors],
+            "rolling_mean_30min": [roll_mean_dict[s] for s in sensors],
+            "rolling_trend_30min": [roll_trend_dict[s] for s in sensors],
+            "neighbor_congestion_ratio": [neigh_cong_ratio[s] for s in sensors],
+            "neighbor_congested_count": [neigh_cong_count[s] for s in sensors],
+            "neighbor_mean_speed": [neigh_speeds_mean[s] for s in sensors],
+            "neighbor_total_count": [neigh_total_count[s] for s in sensors],
+        })
+        
+        return df_results
+
+    def analyze_spillover(
+        self,
+        source_road_id: str,
+        network_predictions: pd.DataFrame,
+    ) -> dict:
+        """
+        Direction-Aware Spillover Analysis (Stage 4).
+        """
+        source_road_id = str(source_road_id)
+        if source_road_id not in self.graph:
+            return {"error": f"Road {source_road_id} not found in graph."}
+            
+        pred_dict = network_predictions.set_index("road_id").to_dict(orient="index")
+        source_info = pred_dict.get(source_road_id, {})
+        
+        hop1_neighbors = list(self.graph.neighbors(source_road_id))
+        hop2_neighbors = set()
+        for n1 in hop1_neighbors:
+            for n2 in self.graph.neighbors(n1):
+                if n2 != source_road_id and n2 not in hop1_neighbors:
+                    hop2_neighbors.add(n2)
+        hop2_neighbors = list(hop2_neighbors)
+        
+        spillover_targets = []
+        
+        for n in hop1_neighbors:
+            info = pred_dict.get(n, {})
+            prob = float(info.get("congestion_probability", 0.0))
+            
+            if self.prop_engine:
+                rel = self.prop_engine.get_relationship(source_road_id, n)
+            else:
+                rel = {"direction_label": "Graph neighbor — direction uncertain", "confidence": "Low", "best_lag_minutes": 5, "is_directional": False}
+                
+            horizon = rel.get("best_lag_minutes", 5) if rel.get("is_directional") else 5
+            explanation = self.generate_early_warning_explanation(n, network_predictions, source_road_id=source_road_id, hop=1)
+            
+            spillover_targets.append({
+                "road_id": n,
+                "hop_distance": 1,
+                "estimated_horizon_min": int(horizon),
+                "current_speed": float(info.get("current_speed", 0.0)),
+                "congestion_probability": prob,
+                "raw_rf_probability": float(info.get("raw_rf_probability", prob)),
+                "risk_level": self.get_risk_level(prob),
+                "early_warning_state": info.get("early_warning_state", "NORMAL"),
+                "TRM": float(info.get("TRM", 0.0)),
+                "SCP": float(info.get("SCP", 0.0)),
+                "PSI": float(info.get("PSI", 0.0)),
+                "p_congestion_5min": float(info.get("p_congestion_5min", prob)),
+                "p_congestion_10min": float(info.get("p_congestion_10min", prob)),
+                "p_congestion_15min": float(info.get("p_congestion_15min", prob)),
+                "probable_source": source_road_id,
+                "propagation_direction_label": rel.get("direction_label", "Graph neighbor — direction uncertain"),
+                "propagation_confidence": rel.get("confidence", "Low"),
+                "correlation_score": rel.get("correlation_score", 0.0),
+                "is_directional": rel.get("is_directional", False),
+                "explanation": explanation["summary_bullets"],
+                "explanation_details": explanation,
+            })
+            
+        for n in hop2_neighbors:
+            info = pred_dict.get(n, {})
+            prob = max(0.0, float(info.get("congestion_probability", 0.0)) * 0.92)
+            
+            best_intermediate = None
+            best_rel = None
+            for n1 in hop1_neighbors:
+                if self.graph.has_edge(n1, n):
+                    if self.prop_engine:
+                        r = self.prop_engine.get_relationship(n1, n)
+                        if best_rel is None or r.get("correlation_score", 0) > best_rel.get("correlation_score", 0):
+                            best_rel = r
+                            best_intermediate = n1
+                            
+            if best_rel is None:
+                best_rel = {"direction_label": "Graph neighbor — direction uncertain", "confidence": "Low", "best_lag_minutes": 10, "is_directional": False}
+                best_intermediate = hop1_neighbors[0] if hop1_neighbors else source_road_id
+                
+            horizon = 5 + int(best_rel.get("best_lag_minutes", 10))
+            explanation = self.generate_early_warning_explanation(n, network_predictions, source_road_id=best_intermediate, hop=2)
+            
+            spillover_targets.append({
+                "road_id": n,
+                "hop_distance": 2,
+                "estimated_horizon_min": int(horizon),
+                "current_speed": float(info.get("current_speed", 0.0)),
+                "congestion_probability": prob,
+                "raw_rf_probability": float(info.get("raw_rf_probability", prob)),
+                "risk_level": self.get_risk_level(prob),
+                "early_warning_state": info.get("early_warning_state", "NORMAL"),
+                "TRM": float(info.get("TRM", 0.0)),
+                "SCP": float(info.get("SCP", 0.0)),
+                "PSI": float(info.get("PSI", 0.0)),
+                "p_congestion_5min": float(info.get("p_congestion_5min", prob)),
+                "p_congestion_10min": float(info.get("p_congestion_10min", prob)),
+                "p_congestion_15min": float(info.get("p_congestion_15min", prob)),
+                "probable_source": best_intermediate,
+                "propagation_direction_label": best_rel.get("direction_label", "Graph neighbor — direction uncertain"),
+                "propagation_confidence": best_rel.get("confidence", "Low"),
+                "correlation_score": best_rel.get("correlation_score", 0.0),
+                "is_directional": best_rel.get("is_directional", False),
+                "explanation": explanation["summary_bullets"],
+                "explanation_details": explanation,
+            })
+            
+        def sort_key(item):
+            dir_bonus = 0.15 if item["is_directional"] else 0.0
+            return item["congestion_probability"] + dir_bonus
+            
+        spillover_targets = sorted(spillover_targets, key=sort_key, reverse=True)
+        propagation_chain = self.build_propagation_chain(source_road_id, network_predictions, max_depth=3)
+        
+        best_reroute = None
+        for target in spillover_targets:
+            if target["current_speed"] > 45.0 and target["congestion_probability"] < 0.35:
+                best_reroute = target["road_id"]
+                break
+        if not best_reroute and hop1_neighbors:
+            best_reroute = sorted(hop1_neighbors, key=lambda n: pred_dict.get(n, {}).get("current_speed", 0), reverse=True)[0]
+            
+        return {
+            "source_road_id": source_road_id,
+            "source_speed": float(source_info.get("current_speed", 0.0)),
+            "source_status": "CONGESTED" if source_info.get("current_speed", 55.0) < self.congestion_threshold else "DETERIORATING",
+            "source_state": source_info.get("early_warning_state", "CRITICAL"),
+            "spillover_targets": spillover_targets,
+            "propagation_chain": propagation_chain,
+            "high_risk_count": sum(1 for t in spillover_targets if t["risk_level"] in ["HIGH", "CRITICAL"] or t["early_warning_state"] in ["HIGH RISK", "CRITICAL"]),
+            "directional_targets_count": sum(1 for t in spillover_targets if t["is_directional"]),
+            "recommended_action": f"⚠ Advisory: Divert traffic away from Road {source_road_id} toward Road {best_reroute}" if best_reroute else "Monitor network closely.",
+        }
+
+    def build_propagation_chain(
+        self,
+        source_road_id: str,
+        network_predictions: pd.DataFrame,
+        max_depth: int = 3,
+    ) -> list:
+        """Build empirical multi-hop cascade propagation chain."""
+        pred_dict = network_predictions.set_index("road_id").to_dict(orient="index")
+        chain = []
+        visited = {str(source_road_id)}
+        
+        src_info = pred_dict.get(str(source_road_id), {})
+        chain.append({
+            "step": 0,
+            "road_id": str(source_road_id),
+            "role": "Source Segment",
+            "current_speed": float(src_info.get("current_speed", 0.0)),
+            "congestion_probability": float(src_info.get("congestion_probability", 1.0)),
+            "early_warning_state": src_info.get("early_warning_state", "CRITICAL"),
+            "horizon_min": 0,
+            "relation_to_prev": "Origin",
+            "confidence": "Ground Truth Observation",
+        })
+        
+        curr_node = str(source_road_id)
+        accum_horizon = 0
+        
+        for d in range(1, max_depth + 1):
+            neighbors = [n for n in self.graph.neighbors(curr_node) if n not in visited]
+            if not neighbors:
+                break
+                
+            candidates = []
+            for n in neighbors:
+                info = pred_dict.get(n, {})
+                prob = float(info.get("congestion_probability", 0.0))
+                rel = self.prop_engine.get_relationship(curr_node, n) if self.prop_engine else {}
+                is_dir = rel.get("is_directional", False)
+                score = prob + (0.20 if is_dir else 0.0)
+                candidates.append((n, score, prob, rel, info))
+                
+            if not candidates:
+                break
+                
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_n, _, best_prob, best_rel, best_info = candidates[0]
+            
+            lag = int(best_rel.get("best_lag_minutes", 5)) if best_rel.get("is_directional") else 5
+            accum_horizon += lag
+            dir_label = best_rel.get("direction_label", "Graph neighbor — direction uncertain")
+            conf = best_rel.get("confidence", "Low")
+            
+            visited.add(best_n)
+            chain.append({
+                "step": d,
+                "road_id": best_n,
+                "role": f"Cascade Hop {d}",
+                "current_speed": float(best_info.get("current_speed", 0.0)),
+                "congestion_probability": best_prob,
+                "early_warning_state": best_info.get("early_warning_state", "NORMAL"),
+                "horizon_min": accum_horizon,
+                "relation_to_prev": dir_label,
+                "confidence": conf,
+                "correlation_score": best_rel.get("correlation_score", 0.0),
+            })
+            curr_node = best_n
+            
+        return chain
+
+    def generate_early_warning_explanation(
+        self,
+        road_id: str,
+        network_predictions: pd.DataFrame,
+        source_road_id: str = None,
+        hop: int = 1,
+    ) -> dict:
+        """Generate factual explainability factors strictly separating Temporal vs Spatial signals."""
+        pred_dict = network_predictions.set_index("road_id").to_dict(orient="index")
+        info = pred_dict.get(str(road_id), {})
+        
+        curr_spd = float(info.get("current_speed", 55.0))
+        prob = float(info.get("congestion_probability", 0.0))
+        state = info.get("early_warning_state", "NORMAL")
+        d5 = float(info.get("speed_delta_5", 0.0))
+        d10 = float(info.get("speed_delta_10", 0.0))
+        trend = float(info.get("rolling_trend_30min", 0.0))
+        roll_mean = float(info.get("rolling_mean_30min", curr_spd))
+        
+        trm = float(info.get("TRM", 0.0))
+        scp = float(info.get("SCP", 0.0))
+        psi = float(info.get("PSI", 0.0))
+        
+        p5 = float(info.get("p_congestion_5min", prob))
+        p10 = float(info.get("p_congestion_10min", prob))
+        p15 = float(info.get("p_congestion_15min", prob))
+        
+        neigh_ratio = float(info.get("neighbor_congestion_ratio", 0.0))
+        neigh_count = int(info.get("neighbor_congested_count", 0))
+        neigh_total = int(info.get("neighbor_total_count", 1))
+        neigh_spd = float(info.get("neighbor_mean_speed", 55.0))
+        
+        temporal_signals = []
+        spatial_signals = []
+        multi_horizon_signals = []
+        summary_bullets = []
+        
+        # 1. Temporal signals
+        if curr_spd < self.congestion_threshold:
+            t_msg = f"Current speed is {curr_spd:.1f} mph (strictly below {self.congestion_threshold} mph congestion threshold)"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+        elif curr_spd < self.congestion_threshold + 8.0:
+            t_msg = f"Current speed is {curr_spd:.1f} mph (approaching critical {self.congestion_threshold} mph threshold)"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+            
+        if d5 <= -3.0:
+            t_msg = f"Speed dropped {abs(d5):.1f} mph in the last 5 minutes (rapid deceleration)"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+        elif d5 > 0:
+            temporal_signals.append(f"Speed increased +{d5:.1f} mph in the last 5 minutes (recovering)")
+            
+        if d10 <= -5.0:
+            t_msg = f"Speed dropped {abs(d10):.1f} mph over the last 10 minutes (TRM: {trm:.2f})"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+            
+        if trend <= -4.0:
+            t_msg = f"30-minute rolling trend shows continuous deterioration ({trend:.1f} mph)"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+        elif abs(curr_spd - roll_mean) >= 5.0 and curr_spd < roll_mean:
+            t_msg = f"Current speed is {roll_mean - curr_spd:.1f} mph below its 30-min rolling baseline ({roll_mean:.1f} mph)"
+            temporal_signals.append(t_msg)
+            summary_bullets.append(f"✓ {t_msg}")
+            
+        if not temporal_signals:
+            temporal_signals.append("Temporal flow dynamics currently stable.")
+            
+        # 2. Spatial signals
+        if source_road_id:
+            rel = self.prop_engine.get_relationship(source_road_id, str(road_id)) if self.prop_engine else {}
+            if rel.get("is_directional") and not rel.get("is_counter_flow"):
+                s_msg = f"Probable downstream propagation path from Road {source_road_id} (Est. lag: {rel.get('best_lag_minutes', 5)} min, Confidence: {rel.get('confidence', 'Medium')}, PSI: {psi:.2f})"
+                spatial_signals.append(s_msg)
+                summary_bullets.append(f"✓ {s_msg}")
+            elif hop == 1:
+                s_msg = f"Direct graph neighbor to source Road {source_road_id} (Direction uncertain)"
+                spatial_signals.append(s_msg)
+            else:
+                s_msg = f"Secondary graph node (2 hops from Road {source_road_id})"
+                spatial_signals.append(s_msg)
+                
+        if neigh_ratio > 0.25:
+            s_msg = f"{int(neigh_ratio * 100)}% ({neigh_count} of {neigh_total}) connected graph neighbors congested (SCP: {scp:.2f})"
+            spatial_signals.append(s_msg)
+            summary_bullets.append(f"✓ {s_msg}")
+        elif neigh_count > 0:
+            s_msg = f"{neigh_count} connected graph neighbor is currently congested"
+            spatial_signals.append(s_msg)
+            summary_bullets.append(f"✓ {s_msg}")
+            
+        if neigh_spd < 35.0:
+            s_msg = f"Surrounding road network flow slowing down (neighbor mean: {neigh_spd:.1f} mph)"
+            spatial_signals.append(s_msg)
+            summary_bullets.append(f"✓ {s_msg}")
+            
+        if not spatial_signals:
+            spatial_signals.append("No immediate neighboring congestion pressure detected.")
+            
+        # 3. Multi-Horizon Outlook
+        multi_horizon_signals.append(f"5-min Risk: {p5*100:.1f}% | 10-min Risk: {p10*100:.1f}% | 15-min Risk: {p15*100:.1f}%")
+        
+        # 4. Model signal
+        model_signal = f"Stage 4 Integrated Risk: {prob * 100:.1f}% [TRM: {trm:.2f}, SCP: {scp:.2f}, PSI: {psi:.2f}] → State: [{state}]."
+        
+        return {
+            "road_id": str(road_id),
+            "state": state,
+            "congestion_probability": prob,
+            "TRM": trm,
+            "SCP": scp,
+            "PSI": psi,
+            "p_congestion_5min": p5,
+            "p_congestion_10min": p10,
+            "p_congestion_15min": p15,
+            "temporal_signals": temporal_signals,
+            "spatial_signals": spatial_signals,
+            "multi_horizon_signals": multi_horizon_signals,
+            "model_signal": model_signal,
+            "summary_bullets": summary_bullets if summary_bullets else [f"✓ {model_signal}"],
+        }

@@ -1,0 +1,165 @@
+"""
+src/simulator.py
+----------------
+STAGE 10 — Real-Time Traffic Simulator for Live Demonstrations.
+
+Simulates dynamic road traffic conditions and cascades:
+1. Normal Traffic: Baseline highway flow with natural stochastic variations.
+2. Rush Hour Patterns: Morning (07:00–10:00) and Evening (16:00–20:00) congestion waves.
+3. Incidents/Accidents: User-triggered accidents that abruptly drop speed on target road segments.
+4. Congestion Propagation: Simulates the physical delay and spillover to adjacent graph neighbors over time.
+"""
+
+import os
+import sys
+import json
+import random
+import logging
+import numpy as np
+import pandas as pd
+import networkx as nx
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
+from src.predictor import SpilloverPredictor
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
+log = logging.getLogger("simulator")
+
+
+class TrafficSimulator:
+    def __init__(
+        self,
+        graph_path: str = config.ADJACENCY_PKL,
+        predictor: SpilloverPredictor = None,
+    ):
+        """Initialize simulation environment with 207 road network nodes."""
+        if not os.path.exists(graph_path):
+            raise FileNotFoundError(f"Graph not found at {graph_path}.")
+            
+        import pickle
+        with open(graph_path, "rb") as f:
+            self.graph = pickle.load(f)
+            
+        self.sensor_ids = list(self.graph.nodes())
+        self.predictor = predictor
+        
+        # State variables
+        self.current_time = pd.Timestamp("2026-10-15 08:00:00")
+        self.active_incidents = {} # road_id -> {severity: 'High', step_count: 0}
+        self.history_buffer = [] # list of pd.Series (past speeds)
+        
+        # Initialize normal baseline speeds (55 - 68 mph)
+        self.current_speeds = pd.Series(
+            data=np.random.uniform(58.0, 66.0, size=len(self.sensor_ids)).astype(np.float32),
+            index=self.sensor_ids,
+        )
+        
+        # Warmup history buffer with 6 initial steps
+        for _ in range(6):
+            self.history_buffer.append(self.current_speeds.copy())
+
+    def trigger_incident(self, road_id: str, severity: str = "High"):
+        """Inject an accident/incident on a specific road."""
+        road_id = str(road_id)
+        if road_id in self.sensor_ids:
+            self.active_incidents[road_id] = {
+                "severity": severity,
+                "step_count": 0,
+            }
+            # Immediate speed drop on incident road
+            drop_speed = 10.0 if severity == "High" else (16.0 if severity == "Medium" else 22.0)
+            self.current_speeds[road_id] = drop_speed
+            log.info("🚨 Incident triggered on Road %s (%s severity: speed %.1f mph)", road_id, severity, drop_speed)
+
+    def clear_incidents(self):
+        """Reset all active incidents."""
+        self.active_incidents.clear()
+
+    def reset(self):
+        """Reset network state (alias for reset_network)."""
+        self.reset_network()
+
+    def induce_incident(self, road_id: str, target_speed: float = 12.0, duration_steps: int = 4) -> dict:
+        """Induce synthetic incident speed drop on a target sensor and return step state."""
+        road_id = str(road_id)
+        if road_id in self.sensor_ids:
+            self.active_incidents[road_id] = {
+                "severity": "High",
+                "step_count": 0,
+            }
+            self.current_speeds[road_id] = target_speed
+            log.info("🚨 Incident induced on Road %s (target speed: %.1f mph)", road_id, target_speed)
+        return self.step()
+
+    def step(self, traffic_intensity: float = 0.5, propagation_rate: float = 0.4, regime: str = None) -> dict:
+        """
+        Advance the simulation by one 5-minute interval.
+        """
+        self.current_time += pd.Timedelta(minutes=5)
+        new_speeds = self.current_speeds.copy()
+        
+        # 1. Base traffic fluctuation
+        hour = self.current_time.hour
+        is_rush = (7 <= hour <= 10) or (16 <= hour <= 20)
+        base_noise = np.random.normal(0.0, 1.2, size=len(self.sensor_ids))
+        
+        for s in self.sensor_ids:
+            if s not in self.active_incidents:
+                # Slowly recover toward normal baseline if no incident
+                target_speed = 45.0 if (is_rush and random.random() < traffic_intensity * 0.4) else 62.0
+                updated_val = float(new_speeds[s] * 0.85 + target_speed * 0.15 + base_noise[self.sensor_ids.index(s)])
+                new_speeds[s] = np.float32(updated_val)
+                
+        # 2. Process active incidents & propagate spillover
+        for inc_road, data in list(self.active_incidents.items()):
+            data["step_count"] += 1
+            severity = data["severity"]
+            base_drop = 8.0 if severity == "High" else 15.0
+            new_speeds[inc_road] = base_drop + np.random.uniform(-1.5, 1.5)
+            
+            # Propagate congestion to 1-hop neighbors
+            for neighbor in self.graph.neighbors(inc_road):
+                if neighbor not in self.active_incidents:
+                    # Degradation increases with incident duration and propagation rate
+                    decay_factor = min(0.6, 0.15 * data["step_count"] * propagation_rate)
+                    target_neigh_speed = max(14.0, new_speeds[neighbor] * (1.0 - decay_factor))
+                    new_speeds[neighbor] = new_speeds[neighbor] * 0.6 + target_neigh_speed * 0.4
+                    
+            # Propagate slightly to 2-hop neighbors after 2 steps
+            if data["step_count"] >= 2:
+                for n1 in self.graph.neighbors(inc_road):
+                    for n2 in self.graph.neighbors(n1):
+                        if n2 != inc_road and n2 not in self.graph.neighbors(inc_road):
+                            new_speeds[n2] = max(24.0, new_speeds[n2] * 0.88)
+                            
+        # Clip speeds to realistic highway bounds
+        new_speeds = new_speeds.clip(lower=5.0, upper=75.0)
+        self.current_speeds = new_speeds
+        
+        # Update history
+        self.history_buffer.append(self.current_speeds.copy())
+        if len(self.history_buffer) > 12:
+            self.history_buffer.pop(0)
+            
+        history_df = pd.DataFrame(self.history_buffer)
+        
+        # 3. Compute live AI Predictions if predictor is attached
+        ai_predictions = None
+        if self.predictor is not None:
+            ai_predictions = self.predictor.predict_network(
+                current_speeds=self.current_speeds,
+                speed_history=history_df,
+                timestamp=self.current_time,
+            )
+            
+        congested_count = int((self.current_speeds < config.CONGESTION_THRESHOLD_MPH).sum())
+        
+        return {
+            "timestamp": self.current_time,
+            "speeds": self.current_speeds,
+            "history": history_df,
+            "congested_count": congested_count,
+            "active_incidents": list(self.active_incidents.keys()),
+            "ai_predictions": ai_predictions,
+        }
