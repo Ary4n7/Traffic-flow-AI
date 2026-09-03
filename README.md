@@ -14,21 +14,21 @@ Indian roads contain mixed, dense, non-lane-based traffic, creating dangerous in
 
 ```mermaid
 flowchart TD
-    subgraph Data Layer (India-First Datasets)
+    subgraph data_layer ["Data Layer (India-First Datasets)"]
         A[Indian Driving Dataset IDD\n10,000+ Annotated Mixed Traffic Frames] --> B[Computer Vision Safety Pipeline\nYOLOv8 Detection & Centroid Tracker]
         C[Indian Urban Traffic Telemetry\nBTP/DTP/MoRTH Speed Records & Graph] --> D[NetworkX Indian Road Graph\nBengaluru, Delhi & Mumbai Networks]
     end
 
-    subgraph Feature Engineering & Safety Logic
+    subgraph feature_eng ["Feature Engineering & Safety Logic"]
         B --> E[Surrogate Safety Metrics\nTime-To-Collision TTC & VRU Shield]
         D --> F[Spatio-Temporal Graph Features\nNeighbor Lags, Deltas & Proximity Matrix]
     end
 
-    subgraph Machine Learning & Multi-Horizon Inference
+    subgraph ml_inference ["Machine Learning & Multi-Horizon Inference"]
         E & F --> G[Calibrated Spatio-Temporal RF\n5, 10 & 15-Minute Spillover Predictors]
     end
 
-    subgraph Proactive Intervention
+    subgraph proactive_int ["Proactive Intervention"]
         G --> H[Proactive Rerouting Engine\nDual-Reason Congestion % + Safety]
         H --> I[Streamlit Master Command Center\nGIS Map, Camera Feed, Near-Miss Log]
     end
