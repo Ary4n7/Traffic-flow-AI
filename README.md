@@ -86,3 +86,11 @@ Open **`http://localhost:8501`** in your browser.
 - **Bandwidth Resilience:** Heavy Computer Vision processing runs **locally at 30 FPS**. Only lightweight summarized JSON logs (2 KB/s) are sent over cellular MQTT networks.
 - **Municipal Economic ROI:** Equipping an urban corridor costs significantly less than the societal, healthcare, and infrastructure cost of a single fatal accident (**~$50,000+**).
 # Traffic-flow-AI
+
+---
+
+## 👥 Team DataDrift
+- Sneha Kharwar
+- Aryan Singh
+- Karan Gala
+- Aastha Gujar
