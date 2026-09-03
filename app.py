@@ -205,7 +205,7 @@ st.markdown("""
     }
 
     section[data-testid="stSidebar"] {
-        background-color: #0F172A;
+        background-color: #151D2A;
         border-right: 1px solid #1E293B;
     }
 </style>
@@ -247,7 +247,6 @@ rec_engine = st.session_state.rec_engine
 
 
 # ── Sidebar Controls ─────────────────────────────────────────────────────────
-st.sidebar.image("https://img.icons8.com/color/96/shield-with-cross.png", width=56)
 st.sidebar.title("PR·VIGIL Control Panel")
 st.sidebar.caption("India-First AI Road Safety System")
 
@@ -661,8 +660,8 @@ with tab_safety:
     col_cam, col_vru = st.columns([3, 2])
     
     with col_cam:
-        st.markdown(f"#### 🎥 LIVE ROAD CAMERA STREAM — {state['target_city'].upper()} [{state['scenario'].split(':')[0]}]")
-        st.caption("DEMONSTRATION VIDEO STREAM FOR SELECTED SCENARIO")
+        st.markdown(f"#### 📷 DEMONSTRATION IMAGE — {state['target_city'].upper()} [{state['scenario'].split(':')[0]}]")
+        st.caption("DEMONSTRATION IMAGE FOR SELECTED SCENARIO")
         st.image(annotated_frame, channels="BGR", use_container_width=True, caption=f"YOLOv8 Detection + Centroid Tracking + Trajectory Tail ({state['target_city']} - {state['scenario']})")
 
     with col_vru:
