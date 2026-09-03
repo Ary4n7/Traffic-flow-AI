@@ -8,7 +8,7 @@ to identify empirical lead-lag relationships in traffic flow without assuming
 ground-truth road topology.
 
 Key Principles:
-1. Ground-Truth Honesty: METR-LA provides pairwise physical distances, NOT road-flow direction.
+1. Ground-Truth Honesty: Indian Driving Dataset (IDD) provides pairwise physical distances, NOT road-flow direction.
    We explicitly label inferred links as "Probable propagation direction" or
    "Graph neighbor — direction uncertain".
 2. No Data Leakage: Cross-correlation is computed exclusively on the chronological
@@ -214,7 +214,7 @@ def infer_probable_propagation_directions(
             "title": "TrafficFlow AI — Probable Propagation Direction Mapping",
             "methodology": "Data-driven time-lagged cross-correlation on training set speed and delta series",
             "disclaimer": "Propagation direction is inferred probabilistically from temporal traffic relationships and should not be interpreted as ground-truth road direction.",
-            "dataset": "METR-LA",
+            "dataset": "Indian Driving Dataset (IDD)",
             "lags_evaluated_min": [int(l * 5) for l in lags_steps],
             "correlation_threshold": corr_threshold,
             "confidence_margin_threshold": conf_diff,

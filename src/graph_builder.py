@@ -3,7 +3,7 @@ src/graph_builder.py
 --------------------
 STAGE 3 — Graph Construction + Spatial Feature Extraction.
 
-Constructs the road-network sensor proximity graph from METR-LA distances
+Constructs the road-network sensor proximity graph from Indian Driving Dataset (IDD) distances
 and computes spatial features for every sensor using NetworkX.
 
 Features calculated per sensor:

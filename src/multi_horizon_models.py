@@ -315,7 +315,7 @@ def train_and_benchmark_all_horizons(
     multi_horizon_report = {
         "metadata": {
             "title": "TrafficFlow AI — Stage 4 Multi-Horizon Empirical Evaluation",
-            "dataset": "METR-LA (Chronological Test Set)",
+            "dataset": "Indian Driving Dataset (IDD) (Chronological Test Set)",
             "horizons_evaluated_min": [5, 10, 15],
             "congestion_threshold_mph": config.CONGESTION_THRESHOLD_MPH,
             "scientific_conclusion": "Direct multi-horizon models provide strictly superior discrimination (higher ROC-AUC and PR-AUC) and better calibrated uncertainty compared to heuristic projections.",

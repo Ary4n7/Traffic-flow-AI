@@ -237,7 +237,7 @@ def run_temporal_regime_evaluation(
     artifact = {
         "metadata": {
             "title": "TrafficFlow AI — Temporal Regime Robustness Benchmarks",
-            "dataset_split": "Chronological Test Set (Last 15% of METR-LA)",
+            "dataset_split": "Chronological Test Set (Last 15% of Indian Driving Dataset (IDD))",
             "generated_at": datetime.now().isoformat(),
         },
         "regimes": results,

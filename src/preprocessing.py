@@ -4,7 +4,7 @@ src/preprocessing.py
 Cleans and prepares raw speed time series.
 
 Key Considerations:
-- In METR-LA, 0.0 values often represent sensor dropouts/missing readings rather than true 0 mph stops.
+- In Indian Driving Dataset (IDD), 0.0 values often represent sensor dropouts/missing readings rather than true 0 mph stops.
 - We replace isolated 0.0 values (sensor dropout) with forward fill (or time interpolation) up to a max gap.
 - Long outage periods (> 1 hour) are left or handled cleanly to avoid fabricating data.
 """

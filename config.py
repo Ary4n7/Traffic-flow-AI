@@ -17,8 +17,8 @@ DATA_PROCESSED_DIR  = os.path.join(ROOT_DIR, "data", "processed")
 DATA_SIM_DIR        = os.path.join(ROOT_DIR, "data", "simulation")
 MODELS_DIR          = os.path.join(ROOT_DIR, "models")
 
-METR_LA_H5          = os.path.join(DATA_RAW_DIR, "metr-la.h5")
-DISTANCES_CSV       = os.path.join(DATA_RAW_DIR, "distances_la_2012.csv")
+METR_LA_H5          = os.path.join(DATA_RAW_DIR, "Indian Driving Dataset (IDD).h5")
+DISTANCES_CSV       = os.path.join(DATA_RAW_DIR, "distances_delhi_ncr.csv")
 SENSOR_IDS_TXT      = os.path.join(DATA_RAW_DIR, "graph_sensor_ids.txt")
 
 PROCESSED_SPEEDS    = os.path.join(DATA_PROCESSED_DIR, "speeds.parquet")
@@ -32,7 +32,7 @@ PROPAGATION_JSON    = os.path.join(MODELS_DIR, "propagation_direction.json")
 LEAD_TIME_METRICS_JSON = os.path.join(MODELS_DIR, "warning_lead_time_metrics.json")
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
-# The METR-LA dataset records speed in miles per hour (mph).
+# The Indian Driving Dataset (IDD) dataset records speed in miles per hour (mph).
 SPEED_UNIT          = "mph"
 SAMPLE_INTERVAL_MIN = 5          # minutes between each reading
 

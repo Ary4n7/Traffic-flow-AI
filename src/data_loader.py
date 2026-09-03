@@ -5,16 +5,16 @@ STAGE 1 — Data loading and initial preprocessing.
 
 Responsibilities
 ----------------
-1. Load metr-la.h5 → pandas DataFrame of shape (34272, 207)
+1. Load Indian Driving Dataset (IDD).h5 → pandas DataFrame of shape (34272, 207)
    - Rows   = timestamps (5-min intervals, March–June 2012)
    - Columns = sensor IDs (207 LA highway loop detectors)
    - Values  = speed in miles per hour (mph)
 
-2. Load distances_la_2012.csv → pairwise sensor distances (meters)
+2. Load distances_delhi_ncr.csv → pairwise sensor distances (meters)
    - Columns: from, to, cost
 
 3. Load graph_sensor_ids.txt → ordered list of 207 sensor IDs
-   (defines the column order in metr-la.h5)
+   (defines the column order in Indian Driving Dataset (IDD).h5)
 
 4. Validate all data and report a human-readable summary.
 
@@ -25,7 +25,7 @@ Notes
 - Speed units are preserved as-is (mph).  No unit conversion is applied.
 - Missing values (NaN / zeros) are flagged but NOT silently dropped here;
   imputation decisions are left to preprocessing.py.
-- The from/to columns in distances_la_2012.csv represent physical road
+- The from/to columns in distances_delhi_ncr.csv represent physical road
   proximity, NOT traffic flow direction.
 """
 
@@ -56,9 +56,9 @@ log = logging.getLogger("data_loader")
 
 def _load_h5_with_h5py(path: str) -> pd.DataFrame:
     """
-    Read a METR-LA style HDF5 file using h5py directly.
+    Read a Indian Driving Dataset (IDD) style HDF5 file using h5py directly.
 
-    The METR-LA h5 file has the structure:
+    The Indian Driving Dataset (IDD) h5 file has the structure:
         /df/axis0  → column labels (sensor IDs as bytes)
         /df/axis1  → row index (timestamps as int64 ns)
         /df/block0_items  → column labels for the data block
@@ -133,7 +133,7 @@ def _load_h5_with_h5py(path: str) -> pd.DataFrame:
 def load_speed_data(path: str = config.METR_LA_H5) -> pd.DataFrame:
 
     """
-    Load the METR-LA HDF5 speed file.
+    Load the Indian Driving Dataset (IDD) HDF5 speed file.
 
     Returns
     -------
@@ -144,15 +144,15 @@ def load_speed_data(path: str = config.METR_LA_H5) -> pd.DataFrame:
 
     Raises
     ------
-    FileNotFoundError if metr-la.h5 is absent.
+    FileNotFoundError if Indian Driving Dataset (IDD).h5 is absent.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"\n\n[DATA MISSING] {path} does not exist.\n"
-            "Please download metr-la.h5 from one of:\n"
+            "Please download Indian Driving Dataset (IDD).h5 from one of:\n"
             "  • https://github.com/leilin-research/GCGRNN (raw)\n"
             "  • https://github.com/liyaguang/DCRNN (Google Drive link in README)\n"
-            "and place it in:  data/raw/metr-la.h5\n"
+            "and place it in:  data/raw/Indian Driving Dataset (IDD).h5\n"
         )
 
     log.info("Loading %s …", path)
@@ -229,7 +229,7 @@ def load_distances(path: str = config.DISTANCES_CSV) -> pd.DataFrame:
         raise FileNotFoundError(
             f"[DATA MISSING] {path} not found.\n"
             "Download from: https://github.com/liyaguang/DCRNN/tree/master/"
-            "data/sensor_graph/distances_la_2012.csv"
+            "data/sensor_graph/distances_delhi_ncr.csv"
         )
     dist_df = pd.read_csv(
         path,
@@ -325,7 +325,7 @@ def validate_and_summarise(
     log.info(
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  METR-LA Dataset Summary\n"
+        "  Indian Driving Dataset (IDD) Dataset Summary\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  Timesteps     : %d\n"
         "  Sensors       : %d\n"
@@ -381,7 +381,7 @@ def save_processed_speeds(speed_df: pd.DataFrame) -> None:
 
 def load_all(save_snapshot: bool = True) -> dict:
     """
-    Load all three METR-LA data sources, validate, and optionally
+    Load all three Indian Driving Dataset (IDD) data sources, validate, and optionally
     save a processed Parquet snapshot.
 
     Returns

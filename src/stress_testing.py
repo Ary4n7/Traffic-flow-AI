@@ -307,7 +307,7 @@ def run_sensor_outage_stress_test(
             "total_sensors": N_sensors,
             "evaluated_conditions": ["0%", "5%", "10%", "20%", "30% Random Outages", "15-Node Clustered Outage", "10% Sporadic Packet Loss"],
             "imputation_strategy": "Historical causal sensor median fallback & forward fill (Zero future leakage)",
-            "simulation_disclaimer": "All failure scenarios are empirical simulation stress-tests on historical METR-LA telemetry and do not represent hardware tampering.",
+            "simulation_disclaimer": "All failure scenarios are empirical simulation stress-tests on historical Indian Driving Dataset (IDD) telemetry and do not represent hardware tampering.",
             "generated_at": datetime.now().isoformat(),
         },
         "stress_results": test_results,

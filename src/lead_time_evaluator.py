@@ -209,7 +209,7 @@ def evaluate_warning_lead_time(
     metrics = {
         "metadata": {
             "title": "TrafficFlow AI — Warning Lead Time Historical Test Benchmark",
-            "dataset_split": "Chronological Test Set (Last 15% of METR-LA)",
+            "dataset_split": "Chronological Test Set (Last 15% of Indian Driving Dataset (IDD))",
             "test_timesteps_evaluated": T_test,
             "total_sensors": N_sensors,
             "congestion_threshold_mph": config.CONGESTION_THRESHOLD_MPH,
