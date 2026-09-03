@@ -17,7 +17,7 @@ DATA_PROCESSED_DIR  = os.path.join(ROOT_DIR, "data", "processed")
 DATA_SIM_DIR        = os.path.join(ROOT_DIR, "data", "simulation")
 MODELS_DIR          = os.path.join(ROOT_DIR, "models")
 
-METR_LA_H5          = os.path.join(DATA_RAW_DIR, "Indian Driving Dataset (IDD).h5")
+IDD_H5          = os.path.join(DATA_RAW_DIR, "Indian Driving Dataset (IDD).h5")
 DISTANCES_CSV       = os.path.join(DATA_RAW_DIR, "distances_delhi_ncr.csv")
 SENSOR_IDS_TXT      = os.path.join(DATA_RAW_DIR, "graph_sensor_ids.txt")
 

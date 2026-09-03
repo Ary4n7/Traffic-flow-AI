@@ -130,7 +130,7 @@ def _load_h5_with_h5py(path: str) -> pd.DataFrame:
         return None
 
 
-def load_speed_data(path: str = config.METR_LA_H5) -> pd.DataFrame:
+def load_speed_data(path: str = config.IDD_H5) -> pd.DataFrame:
 
     """
     Load the Indian Driving Dataset (IDD) HDF5 speed file.
